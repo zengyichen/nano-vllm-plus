@@ -22,6 +22,14 @@ dependencies = [
 [project.urls]
 Homepage="https://github.com/GeeeekExplorer/nano-vllm"
 
+
+[[tool.uv.index]]
+name = "volces"
+url = "https://mirrors.volces.com/pypi/simple/"
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nanovllm*"]
