@@ -120,6 +120,11 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
+        if self.rank == 0:
+            print(f"[VRAM] Model Weights: {current / 1024**3:.2f} GB")
+            print(f"[VRAM] Activations (Peak): {(peak - current) / 1024**3:.2f} GB")
+            print(f"[VRAM] KV Cache: {self.kv_cache.element_size() * self.kv_cache.nelement() / 1024**3:.2f} GB")
+            
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]

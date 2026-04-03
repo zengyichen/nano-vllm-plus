@@ -78,9 +78,11 @@ class LLMEngine:
                     prefill_throughput = num_tokens / (perf_counter() - t)
                 else:
                     decode_throughput = -num_tokens / (perf_counter() - t)
+                usage_stats = self.scheduler.block_manager.get_usage_stats()
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
+                    "KV": f"{usage_stats['usage_percent']:.1f}%",
                 })
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids

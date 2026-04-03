@@ -31,6 +31,7 @@ class BlockManager:
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        self.peak_used_blocks: int = 0
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -46,6 +47,8 @@ class BlockManager:
         block.reset()
         self.free_block_ids.remove(block_id)
         self.used_block_ids.add(block_id)
+        if len(self.used_block_ids) > self.peak_used_blocks:
+            self.peak_used_blocks = len(self.used_block_ids)
         return self.blocks[block_id]
 
     def _deallocate_block(self, block_id: int) -> Block:
@@ -110,3 +113,17 @@ class BlockManager:
             self.hash_to_block_id[h] = last_block.block_id
         else:
             assert last_block.hash == -1
+
+    def get_usage_stats(self):
+        total = len(self.blocks)
+        used = len(self.used_block_ids)
+        free = len(self.free_block_ids)
+        peak = self.peak_used_blocks
+        return {
+            "total_blocks": total,
+            "used_blocks": used,
+            "free_blocks": free,
+            "usage_percent": (used / total) * 100 if total > 0 else 0,
+            "peak_used_blocks": peak,
+            "peak_usage_percent": (peak / total) * 100 if total > 0 else 0
+        }
