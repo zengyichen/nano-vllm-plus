@@ -10,6 +10,7 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.utils.quant import get_kv_quantizer
 
 
 class ModelRunner:
@@ -22,6 +23,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.quantizer = get_kv_quantizer(config)
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         backend = "nccl" if device == "cuda" else "gloo"
@@ -109,21 +111,68 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        dtype_size = torch.empty((), dtype=hf_config.torch_dtype).element_size()
+
+        # Handle block size calculation with quantization
+        if self.quantizer:
+            persistent_per_token_head, transient_per_token_head = self.quantizer.bytes_per_token_head(head_dim, dtype_size)
+            block_persistent_bytes = (
+                2
+                * hf_config.num_hidden_layers
+                * self.block_size
+                * num_kv_heads
+                * persistent_per_token_head
+            )
+            # attention.py currently dequantizes cache tensors into fp tensors before attention,
+            # so reserve transient fp workspace proportional to cache footprint.
+            block_transient_bytes = (
+                2
+                * hf_config.num_hidden_layers
+                * self.block_size
+                * num_kv_heads
+                * transient_per_token_head
+            )
+            block_bytes = block_persistent_bytes + block_transient_bytes
+        else:
+            block_persistent_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * dtype_size
+            block_transient_bytes = 0
+            block_bytes = block_persistent_bytes
+
+        available_bytes = int(total * config.gpu_memory_utilization - used - peak + current)
+        config.num_kvcache_blocks = available_bytes // int(block_bytes)
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        
+        # Allocate KV Cache
+        if self.quantizer:
+            self.kv_cache, self.kv_scales = self.quantizer.allocate_cache(
+                hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim, hf_config.torch_dtype, "cuda"
+            )
+        else:
+            self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+            self.kv_scales = None
+            
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
+                module.quantizer = self.quantizer
+                if self.quantizer:
+                    module.k_scales = self.kv_scales[0, layer_id]
+                    module.v_scales = self.kv_scales[1, layer_id]
                 layer_id += 1
 
         if self.rank == 0:
             print(f"[VRAM] Model Weights: {current / 1024**3:.2f} GB")
             print(f"[VRAM] Activations (Peak): {(peak - current) / 1024**3:.2f} GB")
-            print(f"[VRAM] KV Cache: {self.kv_cache.element_size() * self.kv_cache.nelement() / 1024**3:.2f} GB")
+            
+            kv_size = self.kv_cache.element_size() * self.kv_cache.nelement()
+            if self.quantizer:
+                kv_size += self.kv_scales.element_size() * self.kv_scales.nelement()
+            print(f"[VRAM] KV Cache: {kv_size / 1024**3:.2f} GB")
+            if self.quantizer:
+                reserved_tmp = config.num_kvcache_blocks * block_transient_bytes
+                print(f"[VRAM] KV Dequant Workspace(Est.): {reserved_tmp / 1024**3:.2f} GB")
             
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
