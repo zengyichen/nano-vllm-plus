@@ -6,6 +6,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.models.llama3_bnb_adapter import Llama3BNBForCausalLM, is_llama3_bnb_model
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -31,8 +32,14 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device(device)
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
+        self.use_llama3_bnb = is_llama3_bnb_model(config.model, hf_config.model_type)
+        if self.use_llama3_bnb:
+            self.model = Llama3BNBForCausalLM(config.model, torch_dtype=hf_config.torch_dtype)
+        else:
+            if hf_config.model_type != "qwen3":
+                raise NotImplementedError(f"Unsupported model type: {hf_config.model_type}")
+            self.model = Qwen3ForCausalLM(hf_config)
+            load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()

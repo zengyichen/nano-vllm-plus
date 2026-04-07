@@ -43,6 +43,31 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+## Llama-3 8B BNB-4bit
+
+Nano-vLLM now supports `unsloth/llama-3-8b-Instruct-bnb-4bit` via a monkey-patched
+Hugging Face Llama attention path backed by BitsAndBytes 4-bit linear layers.
+
+```python
+from nanovllm import LLM, SamplingParams
+
+model_id = "unsloth/llama-3-8b-Instruct-bnb-4bit"
+llm = LLM(
+  model_id,
+  tensor_parallel_size=1,
+  max_num_seqs=4,
+  max_model_len=4096,
+  max_num_batched_tokens=4096,
+)
+
+sampling_params = SamplingParams(temperature=0.7, max_tokens=128)
+outputs = llm.generate(["Write a haiku about GPUs."], sampling_params)
+print(outputs[0]["text"])
+```
+
+For 8GB GPUs, keep the safety limits above. You can also run
+`python llama3_bnb_adapter.py` to verify BitsAndBytes loading and attention hook injection.
+
 ## Benchmark
 
 See `bench.py` for benchmark.
