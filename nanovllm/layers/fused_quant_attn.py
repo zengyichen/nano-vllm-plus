@@ -285,6 +285,7 @@ def _asym_turboquant_decode_kernel(
     D: tl.constexpr,
     K_CACHE_D: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     OUT_BLOCK: tl.constexpr,
     V_GROUP_SIZE: tl.constexpr,
     SM_SCALE: tl.constexpr,
@@ -319,137 +320,150 @@ def _asym_turboquant_decode_kernel(
     for block_idx in range(num_blocks):
         physical_block = tl.load(BLOCK_TABLE_ptr + seq_idx * stride_bt_s + block_idx * stride_bt_b)
         start_t = block_idx * BLOCK_SIZE
-        offs_t = start_t + tl.arange(0, BLOCK_SIZE)
-        mask_t = offs_t < ctx_len
+        for tile_start in range(0, BLOCK_SIZE, BLOCK_N):
+            token_in_block = tile_start + tl.arange(0, BLOCK_N)
+            offs_t = start_t + token_in_block
+            mask_t = offs_t < ctx_len
 
-        k_gamma = tl.load(
-            K_SCALES_ptr + physical_block * stride_ks_b + offs_t * stride_ks_s + hkv_idx * stride_ks_h + 0 * stride_ks_d,
-            mask=mask_t,
-            other=0.0,
-        )
-        k_norm = tl.load(
-            K_SCALES_ptr + physical_block * stride_ks_b + offs_t * stride_ks_s + hkv_idx * stride_ks_h + 1 * stride_ks_d,
-            mask=mask_t,
-            other=0.0,
-        )
-
-        score_mse = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-        score_qjl = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-
-        for c in range(K_CACHE_D):
-            packed_k = tl.load(
-                K_PACKED_ptr + physical_block * stride_kp_b + offs_t * stride_kp_s + hkv_idx * stride_kp_h + c * stride_kp_d,
+            k_gamma = tl.load(
+                K_SCALES_ptr + physical_block * stride_ks_b + token_in_block * stride_ks_s + hkv_idx * stride_ks_h + 0 * stride_ks_d,
                 mask=mask_t,
-                other=0,
-            ).to(tl.int32)
-
-            n0 = packed_k & 0x0F
-            idx0 = (n0 >> 1).to(tl.int32)
-            c0 = tl.where(
-                idx0 == 0,
-                cb0,
-                tl.where(
-                    idx0 == 1,
-                    cb1,
-                    tl.where(
-                        idx0 == 2,
-                        cb2,
-                        tl.where(
-                            idx0 == 3,
-                            cb3,
-                            tl.where(
-                                idx0 == 4,
-                                cb4,
-                                tl.where(
-                                    idx0 == 5,
-                                    cb5,
-                                    tl.where(idx0 == 6, cb6, cb7),
-                                ),
-                            ),
-                        ),
-                    ),
-                ),
+                other=0.0,
             )
-            q0_val = tl.where((n0 & 1) > 0, 1.0, -1.0)
-
-            d0 = c * 2
-            if d0 < D:
-                q_rot_d0 = tl.load(Q_ROT_ptr + seq_idx * stride_qr_s + hq_idx * stride_qr_h + d0 * stride_qr_d)
-                q_sketch_d0 = tl.load(Q_SKETCH_ptr + seq_idx * stride_qs_s + hq_idx * stride_qs_h + d0 * stride_qs_d)
-                score_mse += c0 * q_rot_d0
-                score_qjl += q0_val * q_sketch_d0
-
-            n1 = (packed_k >> 4) & 0x0F
-            idx1 = (n1 >> 1).to(tl.int32)
-            c1 = tl.where(
-                idx1 == 0,
-                cb0,
-                tl.where(
-                    idx1 == 1,
-                    cb1,
-                    tl.where(
-                        idx1 == 2,
-                        cb2,
-                        tl.where(
-                            idx1 == 3,
-                            cb3,
-                            tl.where(
-                                idx1 == 4,
-                                cb4,
-                                tl.where(
-                                    idx1 == 5,
-                                    cb5,
-                                    tl.where(idx1 == 6, cb6, cb7),
-                                ),
-                            ),
-                        ),
-                    ),
-                ),
+            k_norm = tl.load(
+                K_SCALES_ptr + physical_block * stride_ks_b + token_in_block * stride_ks_s + hkv_idx * stride_ks_h + 1 * stride_ks_d,
+                mask=mask_t,
+                other=0.0,
             )
-            q1_val = tl.where((n1 & 1) > 0, 1.0, -1.0)
 
-            d1 = c * 2 + 1
-            if d1 < D:
-                q_rot_d1 = tl.load(Q_ROT_ptr + seq_idx * stride_qr_s + hq_idx * stride_qr_h + d1 * stride_qr_d)
-                q_sketch_d1 = tl.load(Q_SKETCH_ptr + seq_idx * stride_qs_s + hq_idx * stride_qs_h + d1 * stride_qs_d)
-                score_mse += c1 * q_rot_d1
-                score_qjl += q1_val * q_sketch_d1
+            score_mse = tl.zeros([BLOCK_N], dtype=tl.float32)
+            score_qjl = tl.zeros([BLOCK_N], dtype=tl.float32)
 
-        scores = (score_mse * k_norm + score_qjl * k_gamma * QJL_SCALE) * SM_SCALE
-        scores = tl.where(mask_t, scores, float("-inf"))
-
-        m_new = tl.maximum(m_i, tl.max(scores, 0))
-        alpha = tl.exp(m_i - m_new)
-        p = tl.exp(scores - m_new)
-        l_i = l_i * alpha + tl.sum(p, 0)
-        acc = acc * alpha
-
-        for out_i in range(OUT_BLOCK):
-            d = out_start + out_i
-            if d < D:
-                packed_col = d // 2
-                group_col = d // V_GROUP_SIZE
-                packed_v = tl.load(
-                    V_PACKED_ptr + physical_block * stride_vp_b + offs_t * stride_vp_s + hkv_idx * stride_vp_h + packed_col * stride_vp_d,
+            for c in range(K_CACHE_D):
+                packed_k = tl.load(
+                    K_PACKED_ptr + physical_block * stride_kp_b + token_in_block * stride_kp_s + hkv_idx * stride_kp_h + c * stride_kp_d,
                     mask=mask_t,
                     other=0,
                 ).to(tl.int32)
-                nib = tl.where((d & 1) == 0, packed_v & 0x0F, (packed_v >> 4) & 0x0F).to(tl.float32)
-                v_scale = tl.load(
-                    V_SCALES_ptr + physical_block * stride_vs_b + offs_t * stride_vs_s + hkv_idx * stride_vs_h + group_col * stride_vs_d,
-                    mask=mask_t,
-                    other=0.0,
-                )
-                v_zero = tl.load(
-                    V_ZEROS_ptr + physical_block * stride_vz_b + offs_t * stride_vz_s + hkv_idx * stride_vz_h + group_col * stride_vz_d,
-                    mask=mask_t,
-                    other=0.0,
-                )
-                v_dequant = nib * v_scale + v_zero
-                contrib = tl.sum(p * v_dequant, 0)
-                acc += tl.where(out_offs == d, contrib, 0.0)
 
-        m_i = m_new
+                n0 = packed_k & 0x0F
+                idx0 = (n0 >> 1).to(tl.int32)
+                c0 = tl.where(
+                    idx0 == 0,
+                    cb0,
+                    tl.where(
+                        idx0 == 1,
+                        cb1,
+                        tl.where(
+                            idx0 == 2,
+                            cb2,
+                            tl.where(
+                                idx0 == 3,
+                                cb3,
+                                tl.where(
+                                    idx0 == 4,
+                                    cb4,
+                                    tl.where(
+                                        idx0 == 5,
+                                        cb5,
+                                        tl.where(idx0 == 6, cb6, cb7),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+                q0_val = tl.where((n0 & 1) > 0, 1.0, -1.0)
+
+                d0 = c * 2
+                if d0 < D:
+                    q_rot_d0 = tl.load(Q_ROT_ptr + seq_idx * stride_qr_s + hq_idx * stride_qr_h + d0 * stride_qr_d)
+                    q_sketch_d0 = tl.load(Q_SKETCH_ptr + seq_idx * stride_qs_s + hq_idx * stride_qs_h + d0 * stride_qs_d)
+                    score_mse += c0 * q_rot_d0
+                    score_qjl += q0_val * q_sketch_d0
+
+                n1 = (packed_k >> 4) & 0x0F
+                idx1 = (n1 >> 1).to(tl.int32)
+                c1 = tl.where(
+                    idx1 == 0,
+                    cb0,
+                    tl.where(
+                        idx1 == 1,
+                        cb1,
+                        tl.where(
+                            idx1 == 2,
+                            cb2,
+                            tl.where(
+                                idx1 == 3,
+                                cb3,
+                                tl.where(
+                                    idx1 == 4,
+                                    cb4,
+                                    tl.where(
+                                        idx1 == 5,
+                                        cb5,
+                                        tl.where(idx1 == 6, cb6, cb7),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+                q1_val = tl.where((n1 & 1) > 0, 1.0, -1.0)
+
+                d1 = c * 2 + 1
+                if d1 < D:
+                    q_rot_d1 = tl.load(Q_ROT_ptr + seq_idx * stride_qr_s + hq_idx * stride_qr_h + d1 * stride_qr_d)
+                    q_sketch_d1 = tl.load(Q_SKETCH_ptr + seq_idx * stride_qs_s + hq_idx * stride_qs_h + d1 * stride_qs_d)
+                    score_mse += c1 * q_rot_d1
+                    score_qjl += q1_val * q_sketch_d1
+
+            scores = (score_mse * k_norm + score_qjl * k_gamma * QJL_SCALE) * SM_SCALE
+            scores = tl.where(mask_t, scores, float("-inf"))
+
+            m_new = tl.maximum(m_i, tl.max(scores, 0))
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new)
+            p = tl.where(mask_t, p, 0.0)
+            l_i = l_i * alpha + tl.sum(p, 0)
+
+            packed_cols = out_offs // 2
+            group_cols = out_offs // V_GROUP_SIZE
+            packed_v = tl.load(
+                V_PACKED_ptr
+                + physical_block * stride_vp_b
+                + token_in_block[:, None] * stride_vp_s
+                + hkv_idx * stride_vp_h
+                + packed_cols[None, :] * stride_vp_d,
+                mask=mask_t[:, None] & out_mask[None, :],
+                other=0,
+            ).to(tl.int32)
+            nib = tl.where((out_offs[None, :] & 1) == 0, packed_v & 0x0F, (packed_v >> 4) & 0x0F)
+
+            v_scale = tl.load(
+                V_SCALES_ptr
+                + physical_block * stride_vs_b
+                + token_in_block[:, None] * stride_vs_s
+                + hkv_idx * stride_vs_h
+                + group_cols[None, :] * stride_vs_d,
+                mask=mask_t[:, None] & out_mask[None, :],
+                other=0.0,
+            )
+            v_zero = tl.load(
+                V_ZEROS_ptr
+                + physical_block * stride_vz_b
+                + token_in_block[:, None] * stride_vz_s
+                + hkv_idx * stride_vz_h
+                + group_cols[None, :] * stride_vz_d,
+                mask=mask_t[:, None] & out_mask[None, :],
+                other=0.0,
+            )
+
+            v_dequant = nib.to(tl.float16) * v_scale.to(tl.float16) + v_zero.to(tl.float16)
+            acc_delta = tl.dot(p[None, :].to(tl.float16), v_dequant)
+            acc = acc * alpha + tl.reshape(acc_delta, [OUT_BLOCK]).to(tl.float32)
+
+            m_i = m_new
 
     acc = tl.where(l_i > 0, acc / l_i, 0.0)
     tl.store(
@@ -478,6 +492,7 @@ def fused_asym_quantized_decode_attention(
     num_seqs, num_heads, head_dim = q_rot.shape
     block_size = int(k_cache.shape[1])
     k_cache_dim = int(k_cache.shape[-1])
+    block_n = block_size
     out_block = 32
     num_out_blocks = triton.cdiv(head_dim, out_block)
 
@@ -508,12 +523,13 @@ def fused_asym_quantized_decode_attention(
         D=head_dim,
         K_CACHE_D=k_cache_dim,
         BLOCK_SIZE=block_size,
+        BLOCK_N=block_n,
         OUT_BLOCK=out_block,
         V_GROUP_SIZE=int(v_group_size),
         SM_SCALE=scale,
         QJL_SCALE=math.sqrt(math.pi / 2.0) / float(head_dim),
-        num_warps=2,
-        num_stages=1,
+        num_warps=4,
+        num_stages=2,
     )
     return out.to(out_dtype)
 
