@@ -325,6 +325,9 @@ def _asym_turboquant_decode_kernel(
         other=0.0,
     ).to(tl.float32)
 
+    # Keep tiny codebook in local tensor to avoid repeated global lookup in inner loops.
+    cb_tensor = tl.load(CODEBOOK_ptr + tl.arange(0, 8)).to(tl.float32)
+
     ctx_len = tl.load(CONTEXT_LENS_ptr + seq_idx)
     num_blocks = tl.cdiv(ctx_len, BLOCK_SIZE)
 
@@ -369,12 +372,16 @@ def _asym_turboquant_decode_kernel(
 
                 n0 = packed_k & 0x0F
                 idx0 = (n0 >> 1).to(tl.int32)
-                c0 = tl.load(CODEBOOK_ptr + idx0, mask=mask_t[:, None] & c_mask[None, :], other=0.0)
+                idx0_flat = tl.reshape(idx0, [BLOCK_N * 8])
+                c0 = tl.reshape(tl.gather(cb_tensor, idx0_flat, axis=0), [BLOCK_N, 8])
+                c0 = tl.where(mask_t[:, None] & c_mask[None, :], c0, 0.0)
                 q0_val = tl.where((n0 & 1) > 0, 1.0, -1.0)
 
                 n1 = (packed_k >> 4) & 0x0F
                 idx1 = (n1 >> 1).to(tl.int32)
-                c1 = tl.load(CODEBOOK_ptr + idx1, mask=mask_t[:, None] & c_mask[None, :], other=0.0)
+                idx1_flat = tl.reshape(idx1, [BLOCK_N * 8])
+                c1 = tl.reshape(tl.gather(cb_tensor, idx1_flat, axis=0), [BLOCK_N, 8])
+                c1 = tl.where(mask_t[:, None] & c_mask[None, :], c1, 0.0)
                 q1_val = tl.where((n1 & 1) > 0, 1.0, -1.0)
 
                 q_rot_d0 = tl.gather(q_rot_even, c_idx, axis=0)
