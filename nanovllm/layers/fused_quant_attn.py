@@ -299,6 +299,31 @@ def _asym_turboquant_decode_kernel(
     out_start = out_pid * OUT_BLOCK
     out_offs = out_start + tl.arange(0, OUT_BLOCK)
     out_mask = out_offs < D
+    c_offs = tl.arange(0, K_CACHE_D)
+    d0_offs = c_offs * 2
+    d1_offs = d0_offs + 1
+
+    # Hoist query loads once per (seq, head, out-block) program to avoid repeated global loads.
+    q_rot_even = tl.load(
+        Q_ROT_ptr + seq_idx * stride_qr_s + hq_idx * stride_qr_h + d0_offs * stride_qr_d,
+        mask=d0_offs < D,
+        other=0.0,
+    ).to(tl.float32)
+    q_rot_odd = tl.load(
+        Q_ROT_ptr + seq_idx * stride_qr_s + hq_idx * stride_qr_h + d1_offs * stride_qr_d,
+        mask=d1_offs < D,
+        other=0.0,
+    ).to(tl.float32)
+    q_sketch_even = tl.load(
+        Q_SKETCH_ptr + seq_idx * stride_qs_s + hq_idx * stride_qs_h + d0_offs * stride_qs_d,
+        mask=d0_offs < D,
+        other=0.0,
+    ).to(tl.float32)
+    q_sketch_odd = tl.load(
+        Q_SKETCH_ptr + seq_idx * stride_qs_s + hq_idx * stride_qs_h + d1_offs * stride_qs_d,
+        mask=d1_offs < D,
+        other=0.0,
+    ).to(tl.float32)
 
     ctx_len = tl.load(CONTEXT_LENS_ptr + seq_idx)
     num_blocks = tl.cdiv(ctx_len, BLOCK_SIZE)
@@ -306,16 +331,6 @@ def _asym_turboquant_decode_kernel(
     m_i = -float("inf")
     l_i = 0.0
     acc = tl.zeros([OUT_BLOCK], dtype=tl.float32)
-
-    # Keep small codebook in registers to avoid repeated lookup traffic.
-    cb0 = tl.load(CODEBOOK_ptr + 0)
-    cb1 = tl.load(CODEBOOK_ptr + 1)
-    cb2 = tl.load(CODEBOOK_ptr + 2)
-    cb3 = tl.load(CODEBOOK_ptr + 3)
-    cb4 = tl.load(CODEBOOK_ptr + 4)
-    cb5 = tl.load(CODEBOOK_ptr + 5)
-    cb6 = tl.load(CODEBOOK_ptr + 6)
-    cb7 = tl.load(CODEBOOK_ptr + 7)
 
     for block_idx in range(num_blocks):
         physical_block = tl.load(BLOCK_TABLE_ptr + seq_idx * stride_bt_s + block_idx * stride_bt_b)
@@ -339,84 +354,42 @@ def _asym_turboquant_decode_kernel(
             score_mse = tl.zeros([BLOCK_N], dtype=tl.float32)
             score_qjl = tl.zeros([BLOCK_N], dtype=tl.float32)
 
-            for c in range(K_CACHE_D):
+            for c_base in range(0, K_CACHE_D, 8):
+                c_idx = c_base + tl.arange(0, 8)
+                c_mask = c_idx < K_CACHE_D
                 packed_k = tl.load(
-                    K_PACKED_ptr + physical_block * stride_kp_b + token_in_block * stride_kp_s + hkv_idx * stride_kp_h + c * stride_kp_d,
-                    mask=mask_t,
+                    K_PACKED_ptr
+                    + physical_block * stride_kp_b
+                    + token_in_block[:, None] * stride_kp_s
+                    + hkv_idx * stride_kp_h
+                    + c_idx[None, :] * stride_kp_d,
+                    mask=mask_t[:, None] & c_mask[None, :],
                     other=0,
                 ).to(tl.int32)
 
                 n0 = packed_k & 0x0F
                 idx0 = (n0 >> 1).to(tl.int32)
-                c0 = tl.where(
-                    idx0 == 0,
-                    cb0,
-                    tl.where(
-                        idx0 == 1,
-                        cb1,
-                        tl.where(
-                            idx0 == 2,
-                            cb2,
-                            tl.where(
-                                idx0 == 3,
-                                cb3,
-                                tl.where(
-                                    idx0 == 4,
-                                    cb4,
-                                    tl.where(
-                                        idx0 == 5,
-                                        cb5,
-                                        tl.where(idx0 == 6, cb6, cb7),
-                                    ),
-                                ),
-                            ),
-                        ),
-                    ),
-                )
+                c0 = tl.load(CODEBOOK_ptr + idx0, mask=mask_t[:, None] & c_mask[None, :], other=0.0)
                 q0_val = tl.where((n0 & 1) > 0, 1.0, -1.0)
-
-                d0 = c * 2
-                if d0 < D:
-                    q_rot_d0 = tl.load(Q_ROT_ptr + seq_idx * stride_qr_s + hq_idx * stride_qr_h + d0 * stride_qr_d)
-                    q_sketch_d0 = tl.load(Q_SKETCH_ptr + seq_idx * stride_qs_s + hq_idx * stride_qs_h + d0 * stride_qs_d)
-                    score_mse += c0 * q_rot_d0
-                    score_qjl += q0_val * q_sketch_d0
 
                 n1 = (packed_k >> 4) & 0x0F
                 idx1 = (n1 >> 1).to(tl.int32)
-                c1 = tl.where(
-                    idx1 == 0,
-                    cb0,
-                    tl.where(
-                        idx1 == 1,
-                        cb1,
-                        tl.where(
-                            idx1 == 2,
-                            cb2,
-                            tl.where(
-                                idx1 == 3,
-                                cb3,
-                                tl.where(
-                                    idx1 == 4,
-                                    cb4,
-                                    tl.where(
-                                        idx1 == 5,
-                                        cb5,
-                                        tl.where(idx1 == 6, cb6, cb7),
-                                    ),
-                                ),
-                            ),
-                        ),
-                    ),
-                )
+                c1 = tl.load(CODEBOOK_ptr + idx1, mask=mask_t[:, None] & c_mask[None, :], other=0.0)
                 q1_val = tl.where((n1 & 1) > 0, 1.0, -1.0)
 
-                d1 = c * 2 + 1
-                if d1 < D:
-                    q_rot_d1 = tl.load(Q_ROT_ptr + seq_idx * stride_qr_s + hq_idx * stride_qr_h + d1 * stride_qr_d)
-                    q_sketch_d1 = tl.load(Q_SKETCH_ptr + seq_idx * stride_qs_s + hq_idx * stride_qs_h + d1 * stride_qs_d)
-                    score_mse += c1 * q_rot_d1
-                    score_qjl += q1_val * q_sketch_d1
+                q_rot_d0 = tl.gather(q_rot_even, c_idx, axis=0)
+                q_rot_d1 = tl.gather(q_rot_odd, c_idx, axis=0)
+                q_sketch_d0 = tl.gather(q_sketch_even, c_idx, axis=0)
+                q_sketch_d1 = tl.gather(q_sketch_odd, c_idx, axis=0)
+
+                score_mse += tl.sum(
+                    c0 * q_rot_d0[None, :] + c1 * q_rot_d1[None, :],
+                    axis=1,
+                )
+                score_qjl += tl.sum(
+                    q0_val * q_sketch_d0[None, :] + q1_val * q_sketch_d1[None, :],
+                    axis=1,
+                )
 
             scores = (score_mse * k_norm + score_qjl * k_gamma * QJL_SCALE) * SM_SCALE
             scores = tl.where(mask_t, scores, float("-inf"))
