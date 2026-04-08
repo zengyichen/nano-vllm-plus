@@ -38,6 +38,15 @@ def run_single_mode(mode: str, model_path: str) -> float:
     if mode == "quant":
         kwargs.update(kv_quant_algo="turboquant", kv_quant_bits=4)
         name = "TurboQuant_4bit_prod"
+    elif mode == "asym":
+        kwargs.update(
+            kv_quant_algo="asym_turboquant",
+            kv_quant_bits=4,
+            kv_decode_backend="asym_turboquant",
+            kv_v_bits=4,
+            kv_v_group_size=32,
+        )
+        name = "AsymTurboQuant_4bit"
 
     llm = None
     try:
@@ -66,11 +75,11 @@ def run_mode_subprocess(mode: str, model_path: str) -> float:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["all", "baseline", "quant"], default="all")
+    parser.add_argument("--mode", choices=["all", "baseline", "quant", "asym"], default="all")
     parser.add_argument("--model", default=os.path.expanduser("~/huggingface/Qwen3-0.6B/"))
     args = parser.parse_args()
 
-    if args.mode in {"baseline", "quant"}:
+    if args.mode in {"baseline", "quant", "asym"}:
         throughput = run_single_mode(args.mode, args.model)
         print(json.dumps({"mode": args.mode, "throughput": throughput}))
         return
@@ -86,15 +95,25 @@ def main():
     throughput_quant = run_mode_subprocess("quant", args.model)
 
     print("========================================")
+    print("Asym TurboQuant 4-bit Quantization")
+    print("========================================")
+    throughput_asym = run_mode_subprocess("asym", args.model)
+
+    print("========================================")
     print("Benchmark Comparison Summary")
     print("========================================")
     print(f"Baseline Throughput : {throughput_baseline:.2f} tok/s")
     print(f"TurboQuant 4-bit    : {throughput_quant:.2f} tok/s")
+    print(f"AsymTurboQuant 4-bit: {throughput_asym:.2f} tok/s")
 
     if throughput_baseline > 0 and throughput_quant > 0:
         ratio = throughput_quant / throughput_baseline
         diff = (ratio - 1.0) * 100.0
         print(f"Throughput Impact   : {diff:+.2f}%")
+    if throughput_baseline > 0 and throughput_asym > 0:
+        ratio = throughput_asym / throughput_baseline
+        diff = (ratio - 1.0) * 100.0
+        print(f"Asym Impact         : {diff:+.2f}%")
 
 
 if __name__ == "__main__":

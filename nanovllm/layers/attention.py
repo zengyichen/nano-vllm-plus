@@ -4,7 +4,10 @@ import triton
 import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-from nanovllm.layers.fused_quant_attn import fused_quantized_decode_attention
+from nanovllm.layers.fused_quant_attn import (
+    fused_asym_quantized_decode_attention,
+    fused_quantized_decode_attention,
+)
 from nanovllm.utils.context import get_context
 
 
@@ -50,6 +53,32 @@ def store_kvcache_scales(k_scale: torch.Tensor, v_scale: torch.Tensor, k_cache_s
     assert k_cache_scale.stride(1) == D and v_cache_scale.stride(1) == D
     assert slot_mapping.numel() == N
     store_kvcache_kernel[(N,)](k_scale, k_scale.stride(0), v_scale, v_scale.stride(0), k_cache_scale, v_cache_scale, slot_mapping, D)
+
+
+@triton.jit
+def store_tensor_kernel(
+    src_ptr,
+    src_stride,
+    dst_ptr,
+    dst_stride,
+    slot_mapping_ptr,
+    D: tl.constexpr,
+):
+    idx = tl.program_id(0)
+    slot = tl.load(slot_mapping_ptr + idx)
+    if slot == -1: return
+    src_offsets = idx * src_stride + tl.arange(0, D)
+    dst_offsets = slot * D + tl.arange(0, D)
+    value = tl.load(src_ptr + src_offsets)
+    tl.store(dst_ptr + dst_offsets, value)
+
+
+def store_tensor(src: torch.Tensor, dst: torch.Tensor, slot_mapping: torch.Tensor):
+    N = src.shape[0]
+    D = src.numel() // N
+    assert src.stride(-1) == 1 and dst.stride(-1) == 1
+    assert slot_mapping.numel() == N
+    store_tensor_kernel[(N,)](src, src.stride(0), dst, dst.stride(0), slot_mapping, D)
 
 
 def _build_slot_mapping_from_block_tables(
@@ -112,10 +141,39 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
         self.quantizer = None
         self.k_scales = self.v_scales = None
+        self.v_zeros = None
         self.quant_decode_backend = "auto"
         self.decode_k_workspace = None
         self.decode_v_workspace = None
         self.decode_workspace_tokens = 0
+
+    def _rotate_query(self, q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if hasattr(self.quantizer, "rotate_query"):
+            return self.quantizer.rotate_query(q)
+        algo = getattr(self.quantizer, "algo", None)
+        if algo is None:
+            return q.float().contiguous(), q.float().contiguous()
+        qf = q.to(torch.float32).contiguous()
+        pi = algo.mse.pi.to(q.device, dtype=qf.dtype)
+        s = algo.s.to(q.device, dtype=qf.dtype)
+        return (qf @ pi.t()).contiguous(), (qf @ s.t()).contiguous()
+
+    def _dequantize_k(self, q_tensor: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype, out: torch.Tensor | None = None) -> torch.Tensor:
+        if hasattr(self.quantizer, "dequantize_k"):
+            return self.quantizer.dequantize_k(q_tensor, scales, dtype, out=out)
+        return self.quantizer.dequantize(q_tensor, scales, dtype, out=out)
+
+    def _dequantize_v(
+        self,
+        q_tensor: torch.Tensor,
+        scales: torch.Tensor,
+        zeros: torch.Tensor | None,
+        dtype: torch.dtype,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if hasattr(self.quantizer, "dequantize_v"):
+            return self.quantizer.dequantize_v(q_tensor, scales, zeros, dtype, out=out)
+        return self.quantizer.dequantize(q_tensor, scales, dtype, out=out)
 
     def _run_quantized_varlen_attention(
         self,
@@ -146,8 +204,11 @@ class Attention(nn.Module):
 
         k_q, k_s = _gather_quantized_cache(k_cache, k_scales, slot_mapping)
         v_q, v_s = _gather_quantized_cache(v_cache, v_scales, slot_mapping)
-        k = self.quantizer.dequantize(k_q, k_s, dtype)
-        v = self.quantizer.dequantize(v_q, v_s, dtype)
+        v_z = None
+        if self.v_zeros is not None:
+            v_z, _ = _gather_quantized_cache(self.v_zeros, self.v_zeros, slot_mapping)
+        k = self._dequantize_k(k_q, k_s, dtype)
+        v = self._dequantize_v(v_q, v_s, v_z, dtype)
 
         return flash_attn_varlen_func(
             q,
@@ -196,11 +257,109 @@ class Attention(nn.Module):
 
         k_q, k_s = _gather_quantized_cache(k_cache, k_scales, slot_mapping)
         v_q, v_s = _gather_quantized_cache(v_cache, v_scales, slot_mapping)
+        v_z = None
+        if self.v_zeros is not None:
+            v_z, _ = _gather_quantized_cache(self.v_zeros, self.v_zeros, slot_mapping)
 
         k_buf = self.decode_k_workspace[:total_k_tokens]
         v_buf = self.decode_v_workspace[:total_k_tokens]
-        self.quantizer.dequantize(k_q, k_s, dtype, out=k_buf)
-        self.quantizer.dequantize(v_q, v_s, dtype, out=v_buf)
+        self._dequantize_k(k_q, k_s, dtype, out=k_buf)
+        self._dequantize_v(v_q, v_s, v_z, dtype, out=v_buf)
+
+        if cu_seqlens_q is None:
+            cu_seqlens_q = torch.arange(0, q.shape[0] + 1, device=q.device, dtype=torch.int32)
+        if max_seqlen_k <= 0:
+            max_seqlen_k = int(block_tables.shape[1]) * int(k_cache.shape[1])
+
+        return flash_attn_varlen_func(
+            q,
+            k_buf,
+            v_buf,
+            max_seqlen_q=1,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_k=max_seqlen_k,
+            cu_seqlens_k=cu_seqlens_k,
+            softmax_scale=self.scale,
+            causal=True,
+        )
+
+    def _run_asym_turboquant_decode_attention(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        k_scales: torch.Tensor,
+        v_scales: torch.Tensor,
+        v_zeros: torch.Tensor | None,
+        block_tables: torch.Tensor,
+        context_lens: torch.Tensor,
+        dtype: torch.dtype,
+        pre_slot_mapping: torch.Tensor | None = None,
+        pre_cu_seqlens_k: torch.Tensor | None = None,
+        max_seqlen_k: int = 0,
+        cu_seqlens_q: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        q_rot, q_sketch = self._rotate_query(q)
+        context = get_context()
+        context.quant_q_rot = q_rot
+        context.quant_q_sketch = q_sketch
+
+        if v_zeros is None:
+            return None
+
+        if q.device.type == "cuda":
+            codebook = None
+            if hasattr(self.quantizer, "get_codebook"):
+                codebook = self.quantizer.get_codebook(q.device, dtype=torch.float32)
+            else:
+                algo = getattr(self.quantizer, "algo", None)
+                if algo is not None and hasattr(algo, "mse"):
+                    codebook = algo.mse.codebook.to(q.device, dtype=torch.float32)
+
+            if codebook is not None:
+                return fused_asym_quantized_decode_attention(
+                    q_rot,
+                    q_sketch,
+                    k_cache,
+                    v_cache,
+                    k_scales,
+                    v_scales,
+                    v_zeros,
+                    block_tables,
+                    context_lens,
+                    self.scale,
+                    self.num_kv_heads,
+                    codebook,
+                    int(getattr(self.quantizer, "v_group_size", 32)),
+                    dtype,
+                )
+
+        if self.decode_k_workspace is None or self.decode_v_workspace is None:
+            return None
+
+        if pre_slot_mapping is None or pre_cu_seqlens_k is None:
+            block_size = int(k_cache.shape[1])
+            slot_mapping, cu_seqlens_k = _build_slot_mapping_from_block_tables(
+                block_tables,
+                context_lens,
+                block_size,
+            )
+        else:
+            slot_mapping = pre_slot_mapping
+            cu_seqlens_k = pre_cu_seqlens_k
+
+        total_k_tokens = int(slot_mapping.shape[0])
+        if total_k_tokens <= 0 or total_k_tokens > int(self.decode_workspace_tokens):
+            return None
+
+        k_q, k_s = _gather_quantized_cache(k_cache, k_scales, slot_mapping)
+        v_q, v_s = _gather_quantized_cache(v_cache, v_scales, slot_mapping)
+        v_z = None if v_zeros is None else _gather_quantized_cache(v_zeros, v_zeros, slot_mapping)[0]
+
+        k_buf = self.decode_k_workspace[:total_k_tokens]
+        v_buf = self.decode_v_workspace[:total_k_tokens]
+        self._dequantize_k(k_q, k_s, dtype, out=k_buf)
+        self._dequantize_v(v_q, v_s, v_z, dtype, out=v_buf)
 
         if cu_seqlens_q is None:
             cu_seqlens_q = torch.arange(0, q.shape[0] + 1, device=q.device, dtype=torch.int32)
@@ -227,10 +386,19 @@ class Attention(nn.Module):
 
         if k_cache.numel() and v_cache.numel():
             if self.quantizer:
-                q_k, scale_k = self.quantizer.quantize(k)
-                q_v, scale_v = self.quantizer.quantize(v)
-                store_kvcache(q_k, q_v, k_cache, v_cache, context.slot_mapping)
-                store_kvcache_scales(scale_k, scale_v, k_scales, v_scales, context.slot_mapping)
+                if hasattr(self.quantizer, "quantize_k") and hasattr(self.quantizer, "quantize_v"):
+                    q_k, scale_k = self.quantizer.quantize_k(k)
+                    q_v, scale_v, zero_v = self.quantizer.quantize_v(v)
+                    store_kvcache(q_k, q_v, k_cache, v_cache, context.slot_mapping)
+                    store_tensor(scale_k, k_scales, context.slot_mapping)
+                    if self.v_zeros is not None:
+                        store_tensor(scale_v, v_scales, context.slot_mapping)
+                        store_tensor(zero_v, self.v_zeros, context.slot_mapping)
+                else:
+                    q_k, scale_k = self.quantizer.quantize(k)
+                    q_v, scale_v = self.quantizer.quantize(v)
+                    store_kvcache(q_k, q_v, k_cache, v_cache, context.slot_mapping)
+                    store_kvcache_scales(scale_k, scale_v, k_scales, v_scales, context.slot_mapping)
             else:
                 store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
@@ -271,6 +439,25 @@ class Attention(nn.Module):
         else:    # decode
             if self.quantizer and context.block_tables is not None and context.context_lens is not None:
                 backend = getattr(self, "quant_decode_backend", "auto")
+
+                if backend == "asym_turboquant":
+                    o = self._run_asym_turboquant_decode_attention(
+                        q,
+                        k_cache,
+                        v_cache,
+                        k_scales,
+                        v_scales,
+                        self.v_zeros,
+                        context.block_tables,
+                        context.context_lens,
+                        dtype,
+                        pre_slot_mapping=context.quant_slot_mapping,
+                        pre_cu_seqlens_k=context.quant_cu_seqlens_k,
+                        max_seqlen_k=context.quant_max_seqlen_k,
+                        cu_seqlens_q=context.cu_seqlens_q,
+                    )
+                    if o is not None:
+                        return o
 
                 if backend in {"dequant_flash", "auto"}:
                     o = self._run_quantized_decode_dequant_flash_attention(
@@ -337,8 +524,8 @@ class Attention(nn.Module):
             else:
                 if self.quantizer:
                     # Safety fallback when decode metadata is incomplete.
-                    k_cache = self.quantizer.dequantize(k_cache, k_scales, dtype)
-                    v_cache = self.quantizer.dequantize(v_cache, v_scales, dtype)
+                    k_cache = self._dequantize_k(k_cache, k_scales, dtype)
+                    v_cache = self._dequantize_v(v_cache, v_scales, self.v_zeros, dtype)
                 o = flash_attn_with_kvcache(
                     q.unsqueeze(1),
                     k_cache,

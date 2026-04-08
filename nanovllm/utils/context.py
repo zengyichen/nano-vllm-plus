@@ -15,6 +15,9 @@ class Context:
     quant_slot_mapping: torch.Tensor | None = None
     quant_cu_seqlens_k: torch.Tensor | None = None
     quant_max_seqlen_k: int = 0
+    quant_q_rot: torch.Tensor | None = None
+    quant_q_sketch: torch.Tensor | None = None
+    quant_v_group_size: int = 0
 
 _CONTEXT = Context()
 
@@ -33,6 +36,9 @@ def set_context(
     quant_slot_mapping=None,
     quant_cu_seqlens_k=None,
     quant_max_seqlen_k=0,
+    quant_q_rot=None,
+    quant_q_sketch=None,
+    quant_v_group_size=0,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -47,6 +53,9 @@ def set_context(
         quant_slot_mapping=quant_slot_mapping,
         quant_cu_seqlens_k=quant_cu_seqlens_k,
         quant_max_seqlen_k=quant_max_seqlen_k,
+        quant_q_rot=quant_q_rot,
+        quant_q_sketch=quant_q_sketch,
+        quant_v_group_size=quant_v_group_size,
     )
 
 def reset_context():

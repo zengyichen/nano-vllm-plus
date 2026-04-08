@@ -259,6 +259,266 @@ def _score_only_turboquant_decode_kernel(
 
 
 @triton.jit
+def _asym_turboquant_decode_kernel(
+    Q_ROT_ptr,
+    Q_SKETCH_ptr,
+    K_PACKED_ptr,
+    K_SCALES_ptr,
+    V_PACKED_ptr,
+    V_SCALES_ptr,
+    V_ZEROS_ptr,
+    BLOCK_TABLE_ptr,
+    CONTEXT_LENS_ptr,
+    CODEBOOK_ptr,
+    OUT_ptr,
+    stride_qr_s, stride_qr_h, stride_qr_d,
+    stride_qs_s, stride_qs_h, stride_qs_d,
+    stride_kp_b, stride_kp_s, stride_kp_h, stride_kp_d,
+    stride_ks_b, stride_ks_s, stride_ks_h, stride_ks_d,
+    stride_vp_b, stride_vp_s, stride_vp_h, stride_vp_d,
+    stride_vs_b, stride_vs_s, stride_vs_h, stride_vs_d,
+    stride_vz_b, stride_vz_s, stride_vz_h, stride_vz_d,
+    stride_bt_s, stride_bt_b,
+    stride_o_s, stride_o_h, stride_o_d,
+    num_kv_heads: tl.constexpr,
+    gqa_ratio: tl.constexpr,
+    D: tl.constexpr,
+    K_CACHE_D: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    OUT_BLOCK: tl.constexpr,
+    V_GROUP_SIZE: tl.constexpr,
+    SM_SCALE: tl.constexpr,
+    QJL_SCALE: tl.constexpr,
+):
+    seq_idx = tl.program_id(0)
+    hq_idx = tl.program_id(1)
+    out_pid = tl.program_id(2)
+
+    hkv_idx = hq_idx // gqa_ratio
+    out_start = out_pid * OUT_BLOCK
+    out_offs = out_start + tl.arange(0, OUT_BLOCK)
+    out_mask = out_offs < D
+
+    ctx_len = tl.load(CONTEXT_LENS_ptr + seq_idx)
+    num_blocks = tl.cdiv(ctx_len, BLOCK_SIZE)
+
+    m_i = -float("inf")
+    l_i = 0.0
+    acc = tl.zeros([OUT_BLOCK], dtype=tl.float32)
+
+    # Keep small codebook in registers to avoid repeated lookup traffic.
+    cb0 = tl.load(CODEBOOK_ptr + 0)
+    cb1 = tl.load(CODEBOOK_ptr + 1)
+    cb2 = tl.load(CODEBOOK_ptr + 2)
+    cb3 = tl.load(CODEBOOK_ptr + 3)
+    cb4 = tl.load(CODEBOOK_ptr + 4)
+    cb5 = tl.load(CODEBOOK_ptr + 5)
+    cb6 = tl.load(CODEBOOK_ptr + 6)
+    cb7 = tl.load(CODEBOOK_ptr + 7)
+
+    for block_idx in range(num_blocks):
+        physical_block = tl.load(BLOCK_TABLE_ptr + seq_idx * stride_bt_s + block_idx * stride_bt_b)
+        start_t = block_idx * BLOCK_SIZE
+        offs_t = start_t + tl.arange(0, BLOCK_SIZE)
+        mask_t = offs_t < ctx_len
+
+        k_gamma = tl.load(
+            K_SCALES_ptr + physical_block * stride_ks_b + offs_t * stride_ks_s + hkv_idx * stride_ks_h + 0 * stride_ks_d,
+            mask=mask_t,
+            other=0.0,
+        )
+        k_norm = tl.load(
+            K_SCALES_ptr + physical_block * stride_ks_b + offs_t * stride_ks_s + hkv_idx * stride_ks_h + 1 * stride_ks_d,
+            mask=mask_t,
+            other=0.0,
+        )
+
+        score_mse = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+        score_qjl = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+
+        for c in range(K_CACHE_D):
+            packed_k = tl.load(
+                K_PACKED_ptr + physical_block * stride_kp_b + offs_t * stride_kp_s + hkv_idx * stride_kp_h + c * stride_kp_d,
+                mask=mask_t,
+                other=0,
+            ).to(tl.int32)
+
+            n0 = packed_k & 0x0F
+            idx0 = (n0 >> 1).to(tl.int32)
+            c0 = tl.where(
+                idx0 == 0,
+                cb0,
+                tl.where(
+                    idx0 == 1,
+                    cb1,
+                    tl.where(
+                        idx0 == 2,
+                        cb2,
+                        tl.where(
+                            idx0 == 3,
+                            cb3,
+                            tl.where(
+                                idx0 == 4,
+                                cb4,
+                                tl.where(
+                                    idx0 == 5,
+                                    cb5,
+                                    tl.where(idx0 == 6, cb6, cb7),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            q0_val = tl.where((n0 & 1) > 0, 1.0, -1.0)
+
+            d0 = c * 2
+            if d0 < D:
+                q_rot_d0 = tl.load(Q_ROT_ptr + seq_idx * stride_qr_s + hq_idx * stride_qr_h + d0 * stride_qr_d)
+                q_sketch_d0 = tl.load(Q_SKETCH_ptr + seq_idx * stride_qs_s + hq_idx * stride_qs_h + d0 * stride_qs_d)
+                score_mse += c0 * q_rot_d0
+                score_qjl += q0_val * q_sketch_d0
+
+            n1 = (packed_k >> 4) & 0x0F
+            idx1 = (n1 >> 1).to(tl.int32)
+            c1 = tl.where(
+                idx1 == 0,
+                cb0,
+                tl.where(
+                    idx1 == 1,
+                    cb1,
+                    tl.where(
+                        idx1 == 2,
+                        cb2,
+                        tl.where(
+                            idx1 == 3,
+                            cb3,
+                            tl.where(
+                                idx1 == 4,
+                                cb4,
+                                tl.where(
+                                    idx1 == 5,
+                                    cb5,
+                                    tl.where(idx1 == 6, cb6, cb7),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+            q1_val = tl.where((n1 & 1) > 0, 1.0, -1.0)
+
+            d1 = c * 2 + 1
+            if d1 < D:
+                q_rot_d1 = tl.load(Q_ROT_ptr + seq_idx * stride_qr_s + hq_idx * stride_qr_h + d1 * stride_qr_d)
+                q_sketch_d1 = tl.load(Q_SKETCH_ptr + seq_idx * stride_qs_s + hq_idx * stride_qs_h + d1 * stride_qs_d)
+                score_mse += c1 * q_rot_d1
+                score_qjl += q1_val * q_sketch_d1
+
+        scores = (score_mse * k_norm + score_qjl * k_gamma * QJL_SCALE) * SM_SCALE
+        scores = tl.where(mask_t, scores, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(scores, 0))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new)
+        l_i = l_i * alpha + tl.sum(p, 0)
+        acc = acc * alpha
+
+        for out_i in range(OUT_BLOCK):
+            d = out_start + out_i
+            if d < D:
+                packed_col = d // 2
+                group_col = d // V_GROUP_SIZE
+                packed_v = tl.load(
+                    V_PACKED_ptr + physical_block * stride_vp_b + offs_t * stride_vp_s + hkv_idx * stride_vp_h + packed_col * stride_vp_d,
+                    mask=mask_t,
+                    other=0,
+                ).to(tl.int32)
+                nib = tl.where((d & 1) == 0, packed_v & 0x0F, (packed_v >> 4) & 0x0F).to(tl.float32)
+                v_scale = tl.load(
+                    V_SCALES_ptr + physical_block * stride_vs_b + offs_t * stride_vs_s + hkv_idx * stride_vs_h + group_col * stride_vs_d,
+                    mask=mask_t,
+                    other=0.0,
+                )
+                v_zero = tl.load(
+                    V_ZEROS_ptr + physical_block * stride_vz_b + offs_t * stride_vz_s + hkv_idx * stride_vz_h + group_col * stride_vz_d,
+                    mask=mask_t,
+                    other=0.0,
+                )
+                v_dequant = nib * v_scale + v_zero
+                contrib = tl.sum(p * v_dequant, 0)
+                acc += tl.where(out_offs == d, contrib, 0.0)
+
+        m_i = m_new
+
+    acc = tl.where(l_i > 0, acc / l_i, 0.0)
+    tl.store(
+        OUT_ptr + seq_idx * stride_o_s + hq_idx * stride_o_h + out_offs * stride_o_d,
+        acc,
+        mask=out_mask,
+    )
+
+
+def fused_asym_quantized_decode_attention(
+    q_rot: torch.Tensor,
+    q_sketch: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scales: torch.Tensor,
+    v_scales: torch.Tensor,
+    v_zeros: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    scale: float,
+    num_kv_heads: int,
+    codebook: torch.Tensor,
+    v_group_size: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    num_seqs, num_heads, head_dim = q_rot.shape
+    block_size = int(k_cache.shape[1])
+    k_cache_dim = int(k_cache.shape[-1])
+    out_block = 32
+    num_out_blocks = triton.cdiv(head_dim, out_block)
+
+    out = torch.empty((num_seqs, num_heads, head_dim), device=q_rot.device, dtype=torch.float32)
+    _asym_turboquant_decode_kernel[(num_seqs, num_heads, num_out_blocks)](
+        q_rot,
+        q_sketch,
+        k_cache,
+        k_scales,
+        v_cache,
+        v_scales,
+        v_zeros,
+        block_tables,
+        context_lens,
+        codebook,
+        out,
+        q_rot.stride(0), q_rot.stride(1), q_rot.stride(2),
+        q_sketch.stride(0), q_sketch.stride(1), q_sketch.stride(2),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
+        k_scales.stride(0), k_scales.stride(1), k_scales.stride(2), k_scales.stride(3),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
+        v_scales.stride(0), v_scales.stride(1), v_scales.stride(2), v_scales.stride(3),
+        v_zeros.stride(0), v_zeros.stride(1), v_zeros.stride(2), v_zeros.stride(3),
+        block_tables.stride(0), block_tables.stride(1),
+        out.stride(0), out.stride(1), out.stride(2),
+        num_kv_heads=num_kv_heads,
+        gqa_ratio=num_heads // num_kv_heads,
+        D=head_dim,
+        K_CACHE_D=k_cache_dim,
+        BLOCK_SIZE=block_size,
+        OUT_BLOCK=out_block,
+        V_GROUP_SIZE=int(v_group_size),
+        SM_SCALE=scale,
+        QJL_SCALE=math.sqrt(math.pi / 2.0) / float(head_dim),
+        num_warps=2,
+        num_stages=1,
+    )
+    return out.to(out_dtype)
+
+
+@triton.jit
 def _fused_turboquant_attention_kernel(
     Q_ROT_ptr,
     Q_SKETCH_ptr,

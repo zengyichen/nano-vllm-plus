@@ -21,6 +21,15 @@ class ProdQuantized(NamedTuple):
     norms: torch.Tensor
     mse_bits: int
 
+
+class AsymQuantizedV(NamedTuple):
+    """Output of grouped-linear value quantization."""
+    packed: torch.Tensor
+    scales: torch.Tensor
+    zeros: torch.Tensor
+    bits: int
+    group_size: int
+
 try:
     import triton
     import triton.language as tl
@@ -349,6 +358,71 @@ def _triton_dequantize_prod4(
     return x_hat.to(out_dtype)
 
 
+def _quantize_grouped_linear_4bit(x: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if group_size <= 0 or group_size % 2 != 0:
+        raise ValueError(f"group_size must be positive and even, got {group_size}")
+
+    lead_shape = x.shape[:-1]
+    d = int(x.shape[-1])
+    rows = x.numel() // d
+    group_count = math.ceil(d / group_size)
+    padded_d = group_count * group_size
+
+    x32 = x.to(torch.float32).contiguous().view(rows, d)
+    if padded_d > d:
+        pad = torch.zeros((rows, padded_d - d), dtype=x32.dtype, device=x32.device)
+        x32 = torch.cat([x32, pad], dim=-1)
+    x32 = x32.view(rows, group_count, group_size)
+
+    zeros = x32.amin(dim=-1)
+    max_vals = x32.amax(dim=-1)
+    scales = ((max_vals - zeros).clamp_min(1e-8)) / 15.0
+
+    q = ((x32 - zeros.unsqueeze(-1)) / scales.unsqueeze(-1)).round().clamp(0, 15).to(torch.uint8)
+    q0 = q[..., 0::2]
+    q1 = q[..., 1::2]
+    packed = (q0 | (q1 << 4)).contiguous().view(rows, group_count * (group_size // 2))
+
+    return (
+        packed.view(*lead_shape, packed.shape[-1]).view(torch.int8),
+        scales.view(*lead_shape, group_count).to(x.dtype),
+        zeros.view(*lead_shape, group_count).to(x.dtype),
+    )
+
+
+def _dequantize_grouped_linear_4bit(
+    packed: torch.Tensor,
+    scales: torch.Tensor,
+    zeros: torch.Tensor,
+    group_size: int,
+    out_dim: int,
+    out_dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if group_size <= 0 or group_size % 2 != 0:
+        raise ValueError(f"group_size must be positive and even, got {group_size}")
+
+    lead_shape = scales.shape[:-1]
+    rows = scales[..., 0].numel()
+    group_count = int(scales.shape[-1])
+    packed_u8 = packed.view(torch.uint8).contiguous().view(rows, group_count * (group_size // 2))
+    packed_u8 = packed_u8.view(rows, group_count, group_size // 2)
+
+    q0 = packed_u8 & 0x0F
+    q1 = (packed_u8 >> 4) & 0x0F
+    q = torch.stack([q0, q1], dim=-1).reshape(rows, group_count, group_size)
+
+    x_hat = q.to(torch.float32) * scales.to(torch.float32).unsqueeze(-1) + zeros.to(torch.float32).unsqueeze(-1)
+    x_hat = x_hat.reshape(rows, group_count * group_size)[..., :out_dim]
+    x_hat = x_hat.view(*lead_shape, out_dim)
+    if out is not None:
+        if tuple(out.shape) != tuple(x_hat.shape):
+            raise ValueError(f"dequant out shape mismatch: expected {tuple(x_hat.shape)}, got {tuple(out.shape)}")
+        out.copy_(x_hat.to(out.dtype))
+        return out
+    return x_hat.to(out_dtype)
+
+
 class TurboQuantMSE(nn.Module):
     def __init__(self, d: int, bits: int = 3, seed: int = 0):
         super().__init__()
@@ -435,6 +509,148 @@ class TurboQuantProd(nn.Module):
         x_qjl = c * gamma.to(torch.float32) * (qjl.to(torch.float32) @ self.s.to(qjl.device, dtype=torch.float32))
         x_hat = x_mse + x_qjl
         return x_hat * norm
+
+
+class AsymTurboQuantKVQuantizer:
+    def __init__(self, head_dim: int | None = None, k_bits: int = 4, v_bits: int = 4, v_group_size: int = 32, seed: int = 0):
+        self.bits = int(k_bits)
+        self.scale_dim = 1
+        self.head_dim = int(head_dim) if head_dim is not None else None
+        self.v_bits = int(v_bits)
+        self.v_group_size = int(v_group_size)
+        self.seed = int(seed)
+        self.k_algo: TurboQuantProd | None = None
+        self.v_scale_dim = 2
+        if self.bits != 4:
+            raise ValueError("AsymTurboQuantKVQuantizer currently implements 4-bit K only")
+        if self.v_bits != 4:
+            raise ValueError("AsymTurboQuantKVQuantizer currently implements 4-bit grouped-linear V only")
+        if self.v_group_size <= 0 or self.v_group_size % 2 != 0:
+            raise ValueError(f"v_group_size must be positive and even, got {self.v_group_size}")
+        if head_dim is not None:
+            self._ensure_algo(int(head_dim), torch.device("cpu"))
+
+    def _ensure_algo(self, head_dim: int, device: torch.device):
+        if self.k_algo is None or self.k_algo.d != head_dim:
+            self.k_algo = TurboQuantProd(head_dim, bits=self.bits, seed=self.seed)
+        self.k_algo = self.k_algo.to(device)
+        self.head_dim = int(head_dim)
+
+    def allocate_cache(self, num_layers, num_blocks, block_size, num_kv_heads, head_dim, dtype, device):
+        raise RuntimeError("use allocate_cache_split for AsymTurboQuantKVQuantizer")
+
+    def allocate_cache_split(self, num_layers, num_blocks, block_size, num_kv_heads, head_dim, dtype, device):
+        self._ensure_algo(int(head_dim), torch.device(device))
+        k_cache_dim = (int(head_dim) + 1) // 2 if self.bits == 4 and _TRITON_AVAILABLE else int(head_dim)
+        v_cache_dim = (int(head_dim) + 1) // 2
+        group_count = math.ceil(int(head_dim) / self.v_group_size)
+
+        k_cache = torch.empty(int(num_layers), int(num_blocks), int(block_size), int(num_kv_heads), k_cache_dim, dtype=torch.int8, device=device)
+        k_scales = torch.empty(int(num_layers), int(num_blocks), int(block_size), int(num_kv_heads), 2, dtype=dtype, device=device)
+        v_cache = torch.empty(int(num_layers), int(num_blocks), int(block_size), int(num_kv_heads), v_cache_dim, dtype=torch.int8, device=device)
+        v_scales = torch.empty(int(num_layers), int(num_blocks), int(block_size), int(num_kv_heads), group_count, dtype=dtype, device=device)
+        v_zeros = torch.empty_like(v_scales)
+        return k_cache, k_scales, v_cache, v_scales, v_zeros
+
+    def quantize_k(self, tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        self._ensure_algo(tensor.shape[-1], tensor.device)
+        assert self.k_algo is not None
+
+        if _triton_prod4_enabled(self.bits, tensor.device):
+            packed, gamma, norm = _triton_quantize_prod4(
+                tensor,
+                self.k_algo.mse.pi,
+                self.k_algo.mse.codebook,
+                self.k_algo.s,
+            )
+            scales = torch.cat([gamma, norm], dim=-1).to(tensor.dtype)
+            return packed, scales
+
+        idx, qjl, gamma, norm = self.k_algo.quantize(tensor)
+        qjl_bit = (qjl > 0).to(torch.uint8)
+        packed = ((idx.to(torch.uint8) << 1) | qjl_bit).view(torch.int8)
+        scales = torch.cat([gamma, norm], dim=-1).to(tensor.dtype)
+        return packed, scales
+
+    def quantize_v(self, tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.head_dim is None:
+            self._ensure_algo(tensor.shape[-1], tensor.device)
+        packed, scales, zeros = _quantize_grouped_linear_4bit(tensor, self.v_group_size)
+        return packed, scales, zeros
+
+    def dequantize_k(self, q_tensor: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype, out: torch.Tensor | None = None) -> torch.Tensor:
+        if self.k_algo is None:
+            self._ensure_algo(self.head_dim or q_tensor.shape[-1], q_tensor.device)
+        assert self.k_algo is not None
+
+        if _triton_prod4_enabled(self.bits, q_tensor.device):
+            return _triton_dequantize_prod4(
+                q_tensor,
+                scales,
+                self.k_algo.mse.pi,
+                self.k_algo.mse.codebook,
+                self.k_algo.s,
+                self.k_algo.d,
+                dtype,
+                out=out,
+            )
+
+        packed_u8 = q_tensor.view(torch.uint8).to(torch.int64)
+        idx = packed_u8 >> 1
+        qjl_bit = packed_u8 & 1
+        qjl = torch.where(qjl_bit > 0, torch.ones_like(q_tensor, dtype=dtype), -torch.ones_like(q_tensor, dtype=dtype))
+        gamma = scales[..., 0:1]
+        norm = scales[..., 1:2]
+        out_tensor = self.k_algo.dequantize(idx, qjl, gamma, norm).to(dtype)
+        if out is not None:
+            if tuple(out.shape) != tuple(out_tensor.shape):
+                raise ValueError(f"dequant out shape mismatch: expected {tuple(out_tensor.shape)}, got {tuple(out.shape)}")
+            out.copy_(out_tensor.to(out.dtype))
+            return out
+        return out_tensor
+
+    def dequantize_v(
+        self,
+        q_tensor: torch.Tensor,
+        scales: torch.Tensor,
+        zeros: torch.Tensor | None,
+        dtype: torch.dtype,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if zeros is None:
+            raise ValueError("zeros tensor is required for asym grouped-linear V dequantization")
+        head_dim = self.head_dim or int(scales.shape[-1]) * self.v_group_size
+        return _dequantize_grouped_linear_4bit(q_tensor, scales, zeros, self.v_group_size, head_dim, dtype, out=out)
+
+    def rotate_query(self, q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.k_algo is None:
+            self._ensure_algo(q.shape[-1], q.device)
+        assert self.k_algo is not None and self.k_algo.mse is not None
+        qf = q.to(torch.float32).contiguous()
+        pi = self.k_algo.mse.pi.to(q.device, dtype=qf.dtype)
+        s = self.k_algo.s.to(q.device, dtype=qf.dtype)
+        return (qf @ pi.t()).contiguous(), (qf @ s.t()).contiguous()
+
+    def get_codebook(self, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        if self.k_algo is None:
+            if self.head_dim is None:
+                raise ValueError("head_dim is not initialized for asym quantizer")
+            self._ensure_algo(self.head_dim, device)
+        assert self.k_algo is not None
+        return self.k_algo.mse.codebook.to(device=device, dtype=dtype)
+
+    def supports_fused_decode(self, device: torch.device) -> bool:
+        return device.type == "cuda" and _TRITON_AVAILABLE
+
+    def dequantize(self, q_tensor: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype, out: torch.Tensor | None = None) -> torch.Tensor:
+        return self.dequantize_k(q_tensor, scales, dtype, out=out)
+
+    def bytes_per_token_head(self, head_dim: int, dtype_size: int) -> tuple[int, int]:
+        k_persistent = (int(head_dim) + 1) // 2 + dtype_size * 2 if self.bits == 4 and _TRITON_AVAILABLE else int(head_dim) + dtype_size * 2
+        group_count = math.ceil(int(head_dim) / self.v_group_size)
+        v_persistent = (int(head_dim) + 1) // 2 + dtype_size * group_count * 2
+        transient = 0
+        return k_persistent + v_persistent, transient
 
 
 class BaseKVQuantizer(ABC):
@@ -655,6 +871,8 @@ def get_kv_quantizer(config) -> BaseKVQuantizer | None:
     bits = config.kv_quant_bits if config.kv_quant_bits is not None else 3
     if algo in {"turboquant", "turboquant_prod", "turboquant-prod"}:
         return TurboQuantProdKVQuantizer(bits)
+    if algo in {"asym_turboquant", "asym-turboquant", "asym"}:
+        return AsymTurboQuantKVQuantizer(k_bits=bits, v_bits=config.kv_v_bits, v_group_size=config.kv_v_group_size)
     if algo in {"turboquant_mse", "turboquant-mse"}:
         return TurboQuantMSEKVQuantizer(bits)
     return None

@@ -31,12 +31,22 @@ class ModelRunner:
         self.decode_v_workspace = None
         self.quant_graph_max_bs = 0
         self.graph_quant_tokens = {}
+        self.split_kv_cache = False
+        self.kv_k_cache = None
+        self.kv_k_scales = None
+        self.kv_v_cache = None
+        self.kv_v_scales = None
+        self.kv_v_zeros = None
         if self.quantizer is not None and self.quant_decode_backend == "auto":
-            # Prioritize throughput recovery with dequant + flash attention path.
-            self.quant_decode_backend = "dequant_flash"
+            if hasattr(self.quantizer, "quantize_k") and hasattr(self.quantizer, "quantize_v"):
+                self.quant_decode_backend = "asym_turboquant"
+            else:
+                # Prioritize throughput recovery with dequant + flash attention path.
+                self.quant_decode_backend = "dequant_flash"
         if self.quantizer is not None and not self.enforce_eager:
-            # Keep eager by default; quant graph replay is currently opt-in.
-            if self.quant_decode_backend != "dequant_flash" or not self.quant_decode_graph:
+            # Keep eager by default; quant graph replay is opt-in per backend.
+            graph_ready_backend = self.quant_decode_backend in {"dequant_flash", "asym_turboquant"}
+            if not (self.quant_decode_graph and graph_ready_backend):
                 self.enforce_eager = True
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -126,12 +136,14 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         dtype_size = torch.empty((), dtype=hf_config.torch_dtype).element_size()
+        split_quant_layout = self.quantizer is not None and hasattr(self.quantizer, "allocate_cache_split")
 
         # Handle block size calculation with quantization
         if self.quantizer:
             persistent_per_token_head, transient_per_token_head = self.quantizer.bytes_per_token_head(head_dim, dtype_size)
+            layout_factor = 1 if split_quant_layout else 2
             block_persistent_bytes = (
-                2
+                layout_factor
                 * hf_config.num_hidden_layers
                 * self.block_size
                 * num_kv_heads
@@ -140,7 +152,7 @@ class ModelRunner:
             # attention.py currently dequantizes cache tensors into fp tensors before attention,
             # so reserve transient fp workspace proportional to cache footprint.
             block_transient_bytes = (
-                2
+                layout_factor
                 * hf_config.num_hidden_layers
                 * self.block_size
                 * num_kv_heads
@@ -157,7 +169,26 @@ class ModelRunner:
         assert config.num_kvcache_blocks > 0
         
         # Allocate KV Cache
-        if self.quantizer:
+        if self.quantizer and hasattr(self.quantizer, "allocate_cache_split"):
+            self.split_kv_cache = True
+            (
+                self.kv_k_cache,
+                self.kv_k_scales,
+                self.kv_v_cache,
+                self.kv_v_scales,
+                self.kv_v_zeros,
+            ) = self.quantizer.allocate_cache_split(
+                hf_config.num_hidden_layers,
+                config.num_kvcache_blocks,
+                self.block_size,
+                num_kv_heads,
+                head_dim,
+                hf_config.torch_dtype,
+                "cuda",
+            )
+            self.kv_cache = None
+            self.kv_scales = None
+        elif self.quantizer:
             self.kv_cache, self.kv_scales = self.quantizer.allocate_cache(
                 hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim, hf_config.torch_dtype, "cuda"
             )
@@ -165,7 +196,7 @@ class ModelRunner:
             self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
             self.kv_scales = None
 
-        if self.quantizer and self.quant_decode_backend == "dequant_flash":
+        if self.quantizer and self.quant_decode_backend in {"dequant_flash", "asym_turboquant"}:
             workspace_bytes = int(config.kv_decode_workspace_mb) * 1024 * 1024
             per_token_bytes = 2 * int(num_kv_heads) * int(head_dim) * int(dtype_size)
             max_tokens = int(config.max_num_seqs) * int(config.max_model_len)
@@ -182,11 +213,16 @@ class ModelRunner:
             else:
                 self.decode_k_workspace = None
                 self.decode_v_workspace = None
-            if self.quant_decode_graph and self.decode_workspace_tokens > 0:
-                self.quant_graph_max_bs = max(
-                    1,
-                    min(int(config.max_num_seqs), self.decode_workspace_tokens // max(1, int(config.max_model_len))),
-                )
+            if self.quant_decode_graph:
+                if self.quant_decode_backend == "dequant_flash" and self.decode_workspace_tokens > 0:
+                    self.quant_graph_max_bs = max(
+                        1,
+                        min(int(config.max_num_seqs), self.decode_workspace_tokens // max(1, int(config.max_model_len))),
+                    )
+                elif self.quant_decode_backend == "asym_turboquant":
+                    self.quant_graph_max_bs = int(config.max_num_seqs)
+                else:
+                    self.quant_graph_max_bs = 0
             else:
                 self.quant_graph_max_bs = 0
         else:
@@ -197,26 +233,45 @@ class ModelRunner:
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
+                if self.split_kv_cache:
+                    module.k_cache = self.kv_k_cache[layer_id]
+                    module.v_cache = self.kv_v_cache[layer_id]
+                else:
+                    module.k_cache = self.kv_cache[0, layer_id]
+                    module.v_cache = self.kv_cache[1, layer_id]
                 module.quantizer = self.quantizer
                 module.quant_decode_backend = self.quant_decode_backend
                 module.decode_k_workspace = self.decode_k_workspace
                 module.decode_v_workspace = self.decode_v_workspace
                 module.decode_workspace_tokens = self.decode_workspace_tokens
                 if self.quantizer:
-                    module.k_scales = self.kv_scales[0, layer_id]
-                    module.v_scales = self.kv_scales[1, layer_id]
+                    if self.split_kv_cache:
+                        module.k_scales = self.kv_k_scales[layer_id]
+                        module.v_scales = self.kv_v_scales[layer_id]
+                        module.v_zeros = self.kv_v_zeros[layer_id]
+                    else:
+                        module.k_scales = self.kv_scales[0, layer_id]
+                        module.v_scales = self.kv_scales[1, layer_id]
+                        module.v_zeros = None
                 layer_id += 1
 
         if self.rank == 0:
             print(f"[VRAM] Model Weights: {current / 1024**3:.2f} GB")
             print(f"[VRAM] Activations (Peak): {(peak - current) / 1024**3:.2f} GB")
             
-            kv_size = self.kv_cache.element_size() * self.kv_cache.nelement()
-            if self.quantizer:
-                kv_size += self.kv_scales.element_size() * self.kv_scales.nelement()
-            print(f"[VRAM] KV Cache: {kv_size / 1024**3:.2f} GB")
+            if self.split_kv_cache:
+                kv_k_size = self.kv_k_cache.element_size() * self.kv_k_cache.nelement()
+                kv_k_size += self.kv_k_scales.element_size() * self.kv_k_scales.nelement()
+                kv_v_size = self.kv_v_cache.element_size() * self.kv_v_cache.nelement()
+                kv_v_size += self.kv_v_scales.element_size() * self.kv_v_scales.nelement()
+                kv_v_size += self.kv_v_zeros.element_size() * self.kv_v_zeros.nelement()
+                print(f"[VRAM] K Cache: {kv_k_size / 1024**3:.2f} GB")
+                print(f"[VRAM] V Cache: {kv_v_size / 1024**3:.2f} GB")
+            else:
+                kv_size = self.kv_cache.element_size() * self.kv_cache.nelement()
+                if self.quantizer:
+                    kv_size += self.kv_scales.element_size() * self.kv_scales.nelement()
+                print(f"[VRAM] KV Cache: {kv_size / 1024**3:.2f} GB")
             if self.decode_k_workspace is not None and self.decode_v_workspace is not None:
                 ws_size = (
                     self.decode_k_workspace.element_size() * self.decode_k_workspace.nelement()
@@ -306,6 +361,7 @@ class ModelRunner:
             seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
             quant_slot_mapping, quant_cu_seqlens_k = self._build_quant_slot_mapping(block_tables, seqlens_k)
             quant_max_seqlen_k = max_seqlen_k
+        quant_v_group_size = int(getattr(self.quantizer, "v_group_size", 0)) if self.quantizer is not None else 0
 
         set_context(
             True,
@@ -319,6 +375,7 @@ class ModelRunner:
             quant_slot_mapping=quant_slot_mapping,
             quant_cu_seqlens_k=quant_cu_seqlens_k,
             quant_max_seqlen_k=quant_max_seqlen_k,
+            quant_v_group_size=quant_v_group_size,
         )
         return input_ids, positions
 
@@ -345,6 +402,7 @@ class ModelRunner:
         if self.quantizer:
             quant_slot_mapping, quant_cu_seqlens_k = self._build_quant_slot_mapping(block_tables, context_lens)
             quant_max_seqlen_k = int(block_tables.shape[1]) * int(self.block_size)
+        quant_v_group_size = int(getattr(self.quantizer, "v_group_size", 0)) if self.quantizer is not None else 0
 
         set_context(
             False,
@@ -355,6 +413,7 @@ class ModelRunner:
             quant_slot_mapping=quant_slot_mapping,
             quant_cu_seqlens_k=quant_cu_seqlens_k,
             quant_max_seqlen_k=quant_max_seqlen_k,
+            quant_v_group_size=quant_v_group_size,
         )
         return input_ids, positions
 
@@ -376,20 +435,29 @@ class ModelRunner:
             if graph_bs is None:
                 return self.model.compute_logits(self.model(input_ids, positions))
 
-            if self.quantizer and self.quant_decode_backend == "dequant_flash" and self.quant_decode_graph:
+            quant_graph_enabled = (
+                self.quantizer is not None
+                and self.quant_decode_graph
+                and self.quant_decode_backend in {"dequant_flash", "asym_turboquant"}
+            )
+            if quant_graph_enabled:
                 if (
                     self.quant_graph_max_bs <= 0
                     or bs > self.quant_graph_max_bs
-                    or context.quant_slot_mapping is None
-                    or context.quant_cu_seqlens_k is None
-                    or "quant_slot_mapping" not in self.graph_vars
-                    or "quant_cu_seqlens_k" not in self.graph_vars
                 ):
                     return self.model.compute_logits(self.model(input_ids, positions))
-                qsm_len = int(context.quant_slot_mapping.numel())
-                graph_qsm_cap = int(self.graph_quant_tokens.get(graph_bs, 0))
-                if qsm_len <= 0 or qsm_len > graph_qsm_cap:
-                    return self.model.compute_logits(self.model(input_ids, positions))
+                if self.quant_decode_backend == "dequant_flash":
+                    if (
+                        context.quant_slot_mapping is None
+                        or context.quant_cu_seqlens_k is None
+                        or "quant_slot_mapping" not in self.graph_vars
+                        or "quant_cu_seqlens_k" not in self.graph_vars
+                    ):
+                        return self.model.compute_logits(self.model(input_ids, positions))
+                    qsm_len = int(context.quant_slot_mapping.numel())
+                    graph_qsm_cap = int(self.graph_quant_tokens.get(graph_bs, 0))
+                    if qsm_len <= 0 or qsm_len > graph_qsm_cap:
+                        return self.model.compute_logits(self.model(input_ids, positions))
 
             graph = self.graphs[graph_bs]
             graph_vars = self.graph_vars
@@ -431,7 +499,7 @@ class ModelRunner:
         max_bs = min(self.config.max_num_seqs, 512)
         quant_graph_enabled = (
             self.quantizer is not None
-            and self.quant_decode_backend == "dequant_flash"
+            and self.quant_decode_backend in {"dequant_flash", "asym_turboquant"}
             and self.quant_decode_graph
         )
         if quant_graph_enabled:
@@ -448,10 +516,11 @@ class ModelRunner:
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
 
+        dequant_graph_enabled = quant_graph_enabled and self.quant_decode_backend == "dequant_flash"
         quant_slot_mapping = None
         quant_cu_seqlens_k = None
         max_quant_tokens = 0
-        if quant_graph_enabled:
+        if dequant_graph_enabled:
             max_quant_tokens = min(int(self.decode_workspace_tokens), max_bs * int(config.max_model_len))
             if max_quant_tokens <= 0:
                 self.enforce_eager = True
@@ -471,7 +540,7 @@ class ModelRunner:
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
 
-            if quant_graph_enabled:
+            if dequant_graph_enabled:
                 cap_tokens = min(max_quant_tokens, bs * int(config.max_model_len))
                 if cap_tokens <= 0:
                     continue
@@ -493,9 +562,16 @@ class ModelRunner:
                     quant_slot_mapping=quant_slot_mapping[:cap_tokens],
                     quant_cu_seqlens_k=quant_cu_seqlens_k[: bs + 1],
                     quant_max_seqlen_k=int(config.max_model_len),
+                    quant_v_group_size=int(getattr(self.quantizer, "v_group_size", 0)),
                 )
             else:
-                set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+                set_context(
+                    False,
+                    slot_mapping=slot_mapping[:bs],
+                    context_lens=context_lens[:bs],
+                    block_tables=block_tables[:bs],
+                    quant_v_group_size=int(getattr(self.quantizer, "v_group_size", 0)) if self.quantizer is not None else 0,
+                )
 
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
@@ -503,7 +579,7 @@ class ModelRunner:
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
-            if quant_graph_enabled:
+            if dequant_graph_enabled:
                 self.graph_quant_tokens[bs] = cap_tokens
             torch.cuda.synchronize()
             reset_context()
@@ -516,6 +592,6 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
-        if quant_graph_enabled:
+        if dequant_graph_enabled:
             self.graph_vars["quant_slot_mapping"] = quant_slot_mapping
             self.graph_vars["quant_cu_seqlens_k"] = quant_cu_seqlens_k
