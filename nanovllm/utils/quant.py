@@ -322,6 +322,7 @@ def _triton_dequantize_prod4(
     s: torch.Tensor,
     out_dim: int,
     out_dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     lead_shape = scales.shape[:-1]
     rows = scales[..., 0].numel()
@@ -339,7 +340,13 @@ def _triton_dequantize_prod4(
     c = math.sqrt(math.pi / 2.0) / float(out_dim)
     x_qjl = c * gamma * (qjl @ s32)
     x_hat = (x_mse + x_qjl) * norm
-    return x_hat.view(*lead_shape, out_dim).to(out_dtype)
+    x_hat = x_hat.view(*lead_shape, out_dim)
+    if out is not None:
+        if tuple(out.shape) != tuple(x_hat.shape):
+            raise ValueError(f"dequant out shape mismatch: expected {tuple(x_hat.shape)}, got {tuple(out.shape)}")
+        out.copy_(x_hat.to(out.dtype))
+        return out
+    return x_hat.to(out_dtype)
 
 
 class TurboQuantMSE(nn.Module):
@@ -444,7 +451,13 @@ class BaseKVQuantizer(ABC):
         pass
 
     @abstractmethod
-    def dequantize(self, q_tensor: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    def dequantize(
+        self,
+        q_tensor: torch.Tensor,
+        scales: torch.Tensor,
+        dtype: torch.dtype,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         pass
 
     def bytes_per_token_head(self, head_dim: int, dtype_size: int) -> tuple[int, int]:
@@ -497,11 +510,23 @@ class TurboQuantMSEKVQuantizer(BaseKVQuantizer):
         q = idx.to(torch.uint8).view(torch.int8)
         return q, norm
 
-    def dequantize(self, q_tensor: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    def dequantize(
+        self,
+        q_tensor: torch.Tensor,
+        scales: torch.Tensor,
+        dtype: torch.dtype,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         self._ensure_algo(q_tensor.shape[-1], q_tensor.device)
         idx = q_tensor.view(torch.uint8).to(torch.int64)
         norm = scales[..., :1]
-        return self.algo.dequantize(idx, norm).to(dtype)
+        out_tensor = self.algo.dequantize(idx, norm).to(dtype)
+        if out is not None:
+            if tuple(out.shape) != tuple(out_tensor.shape):
+                raise ValueError(f"dequant out shape mismatch: expected {tuple(out_tensor.shape)}, got {tuple(out.shape)}")
+            out.copy_(out_tensor.to(out.dtype))
+            return out
+        return out_tensor
 
     def bytes_per_token_head(self, head_dim: int, dtype_size: int) -> tuple[int, int]:
         # Persistent: int8 code per dim + norm scale
@@ -577,7 +602,13 @@ class TurboQuantProdKVQuantizer(BaseKVQuantizer):
         scales = torch.cat([gamma, norm], dim=-1)
         return packed, scales
 
-    def dequantize(self, q_tensor: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    def dequantize(
+        self,
+        q_tensor: torch.Tensor,
+        scales: torch.Tensor,
+        dtype: torch.dtype,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if self.algo is None:
             self._ensure_algo(self.head_dim or q_tensor.shape[-1], q_tensor.device)
 
@@ -590,6 +621,7 @@ class TurboQuantProdKVQuantizer(BaseKVQuantizer):
                 self.algo.s,
                 self.algo.d,
                 dtype,
+                out=out,
             )
 
         packed_u8 = q_tensor.view(torch.uint8).to(torch.int64)
@@ -599,7 +631,13 @@ class TurboQuantProdKVQuantizer(BaseKVQuantizer):
 
         gamma = scales[..., 0:1]
         norm = scales[..., 1:2]
-        return self.algo.dequantize(idx, qjl, gamma, norm).to(dtype)
+        out_tensor = self.algo.dequantize(idx, qjl, gamma, norm).to(dtype)
+        if out is not None:
+            if tuple(out.shape) != tuple(out_tensor.shape):
+                raise ValueError(f"dequant out shape mismatch: expected {tuple(out_tensor.shape)}, got {tuple(out.shape)}")
+            out.copy_(out_tensor.to(out.dtype))
+            return out
+        return out_tensor
 
     def bytes_per_token_head(self, head_dim: int, dtype_size: int) -> tuple[int, int]:
         # For Triton 4-bit prod path we pack two dims per byte.

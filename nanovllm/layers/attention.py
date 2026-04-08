@@ -112,6 +112,10 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
         self.quantizer = None
         self.k_scales = self.v_scales = None
+        self.quant_decode_backend = "auto"
+        self.decode_k_workspace = None
+        self.decode_v_workspace = None
+        self.decode_workspace_tokens = 0
 
     def _run_quantized_varlen_attention(
         self,
@@ -150,6 +154,64 @@ class Attention(nn.Module):
             k,
             v,
             max_seqlen_q=max_seqlen_q,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_k=max_seqlen_k,
+            cu_seqlens_k=cu_seqlens_k,
+            softmax_scale=self.scale,
+            causal=True,
+        )
+
+    def _run_quantized_decode_dequant_flash_attention(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        k_scales: torch.Tensor,
+        v_scales: torch.Tensor,
+        block_tables: torch.Tensor,
+        context_lens: torch.Tensor,
+        dtype: torch.dtype,
+        pre_slot_mapping: torch.Tensor | None = None,
+        pre_cu_seqlens_k: torch.Tensor | None = None,
+        max_seqlen_k: int = 0,
+        cu_seqlens_q: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        if self.decode_k_workspace is None or self.decode_v_workspace is None:
+            return None
+
+        if pre_slot_mapping is None or pre_cu_seqlens_k is None:
+            block_size = int(k_cache.shape[1])
+            slot_mapping, cu_seqlens_k = _build_slot_mapping_from_block_tables(
+                block_tables,
+                context_lens,
+                block_size,
+            )
+        else:
+            slot_mapping = pre_slot_mapping
+            cu_seqlens_k = pre_cu_seqlens_k
+
+        total_k_tokens = int(slot_mapping.shape[0])
+        if total_k_tokens <= 0 or total_k_tokens > int(self.decode_workspace_tokens):
+            return None
+
+        k_q, k_s = _gather_quantized_cache(k_cache, k_scales, slot_mapping)
+        v_q, v_s = _gather_quantized_cache(v_cache, v_scales, slot_mapping)
+
+        k_buf = self.decode_k_workspace[:total_k_tokens]
+        v_buf = self.decode_v_workspace[:total_k_tokens]
+        self.quantizer.dequantize(k_q, k_s, dtype, out=k_buf)
+        self.quantizer.dequantize(v_q, v_s, dtype, out=v_buf)
+
+        if cu_seqlens_q is None:
+            cu_seqlens_q = torch.arange(0, q.shape[0] + 1, device=q.device, dtype=torch.int32)
+        if max_seqlen_k <= 0:
+            max_seqlen_k = int(block_tables.shape[1]) * int(k_cache.shape[1])
+
+        return flash_attn_varlen_func(
+            q,
+            k_buf,
+            v_buf,
+            max_seqlen_q=1,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_k=max_seqlen_k,
             cu_seqlens_k=cu_seqlens_k,
@@ -207,30 +269,49 @@ class Attention(nn.Module):
                     block_table=context.block_tables,
                 )
         else:    # decode
-            if (
-                self.quantizer
-                and context.block_tables is not None
-                and context.context_lens is not None
-                and hasattr(self.quantizer, "supports_fused_decode")
-                and self.quantizer.supports_fused_decode(q.device)
-            ):
-                algo = self.quantizer.algo
-                o = fused_quantized_decode_attention(
-                    q,
-                    k_cache,
-                    v_cache,
-                    k_scales,
-                    v_scales,
-                    context.block_tables,
-                    context.context_lens,
-                    self.scale,
-                    self.num_kv_heads,
-                    self.quantizer,
-                    algo.mse.pi,
-                    algo.mse.codebook,
-                    algo.s,
-                )
-            elif self.quantizer and context.block_tables is not None and context.context_lens is not None:
+            if self.quantizer and context.block_tables is not None and context.context_lens is not None:
+                backend = getattr(self, "quant_decode_backend", "auto")
+
+                if backend in {"dequant_flash", "auto"}:
+                    o = self._run_quantized_decode_dequant_flash_attention(
+                        q,
+                        k_cache,
+                        v_cache,
+                        k_scales,
+                        v_scales,
+                        context.block_tables,
+                        context.context_lens,
+                        dtype,
+                        pre_slot_mapping=context.quant_slot_mapping,
+                        pre_cu_seqlens_k=context.quant_cu_seqlens_k,
+                        max_seqlen_k=context.quant_max_seqlen_k,
+                        cu_seqlens_q=context.cu_seqlens_q,
+                    )
+                    if o is not None:
+                        return o
+
+                if (
+                    backend in {"fused", "auto"}
+                    and hasattr(self.quantizer, "supports_fused_decode")
+                    and self.quantizer.supports_fused_decode(q.device)
+                ):
+                    algo = self.quantizer.algo
+                    return fused_quantized_decode_attention(
+                        q,
+                        k_cache,
+                        v_cache,
+                        k_scales,
+                        v_scales,
+                        context.block_tables,
+                        context.context_lens,
+                        self.scale,
+                        self.num_kv_heads,
+                        self.quantizer,
+                        algo.mse.pi,
+                        algo.mse.codebook,
+                        algo.s,
+                    )
+
                 # Fallback path for non-fused quantization variants.
                 cu_seqlens_q = context.cu_seqlens_q
                 if cu_seqlens_q is None:
