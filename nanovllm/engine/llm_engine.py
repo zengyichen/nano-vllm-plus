@@ -15,6 +15,8 @@ from nanovllm.engine.model_runner import ModelRunner
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
+        self.model_runner = None
+        self._exited = False
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
@@ -34,8 +36,14 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
-        self.model_runner.call("exit")
-        del self.model_runner
+        if self._exited:
+            return
+        self._exited = True
+
+        if self.model_runner is not None:
+            self.model_runner.call("exit")
+            self.model_runner = None
+
         for p in self.ps:
             p.join()
 

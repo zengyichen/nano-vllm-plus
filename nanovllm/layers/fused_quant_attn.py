@@ -1,0 +1,577 @@
+import math
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _fused_compress_mse_kernel(
+    X_ptr,
+    PI_ptr,
+    CENTROIDS_ptr,
+    PACKED_PTR,
+    NORMS_PTR,
+    stride_x_m,
+    stride_x_d,
+    stride_packed_m,
+    stride_packed_d,
+    stride_norm_m,
+    D: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_pair = tl.program_id(1)
+
+    d0 = pid_pair * 2
+    d1 = d0 + 1
+
+    x_offs = tl.arange(0, D)
+    x = tl.load(X_ptr + pid_m * stride_x_m + x_offs * stride_x_d, mask=x_offs < D, other=0.0).to(tl.float32)
+    norm = tl.sqrt(tl.sum(x * x, axis=0))
+    inv_norm = 1.0 / tl.maximum(norm, 1e-10)
+    x = x * inv_norm
+
+    y0 = tl.zeros([], dtype=tl.float32)
+    y1 = tl.zeros([], dtype=tl.float32)
+    for k in range(D):
+        xk = x[k]
+        pi0 = tl.load(PI_ptr + k * D + d0)
+        y0 += xk * pi0
+        if d1 < D:
+            pi1 = tl.load(PI_ptr + k * D + d1)
+            y1 += xk * pi1
+
+    c0 = tl.load(CENTROIDS_PTR + 0)
+    c1 = tl.load(CENTROIDS_PTR + 1)
+    c2 = tl.load(CENTROIDS_PTR + 2)
+    c3 = tl.load(CENTROIDS_PTR + 3)
+    c4 = tl.load(CENTROIDS_PTR + 4)
+    c5 = tl.load(CENTROIDS_PTR + 5)
+    c6 = tl.load(CENTROIDS_PTR + 6)
+    c7 = tl.load(CENTROIDS_PTR + 7)
+
+    best_dist0 = tl.abs(y0 - c0)
+    best_idx0 = tl.zeros([], dtype=tl.int32)
+
+    dist = tl.abs(y0 - c1)
+    take = dist < best_dist0
+    best_dist0 = tl.where(take, dist, best_dist0)
+    best_idx0 = tl.where(take, 1, best_idx0)
+
+    dist = tl.abs(y0 - c2)
+    take = dist < best_dist0
+    best_dist0 = tl.where(take, dist, best_dist0)
+    best_idx0 = tl.where(take, 2, best_idx0)
+
+    dist = tl.abs(y0 - c3)
+    take = dist < best_dist0
+    best_dist0 = tl.where(take, dist, best_dist0)
+    best_idx0 = tl.where(take, 3, best_idx0)
+
+    dist = tl.abs(y0 - c4)
+    take = dist < best_dist0
+    best_dist0 = tl.where(take, dist, best_dist0)
+    best_idx0 = tl.where(take, 4, best_idx0)
+
+    dist = tl.abs(y0 - c5)
+    take = dist < best_dist0
+    best_dist0 = tl.where(take, dist, best_dist0)
+    best_idx0 = tl.where(take, 5, best_idx0)
+
+    dist = tl.abs(y0 - c6)
+    take = dist < best_dist0
+    best_dist0 = tl.where(take, dist, best_dist0)
+    best_idx0 = tl.where(take, 6, best_idx0)
+
+    dist = tl.abs(y0 - c7)
+    take = dist < best_dist0
+    best_idx0 = tl.where(take, 7, best_idx0)
+
+    best_idx1 = tl.zeros([], dtype=tl.int32)
+    if d1 < D:
+        best_dist1 = tl.abs(y1 - c0)
+
+        dist = tl.abs(y1 - c1)
+        take = dist < best_dist1
+        best_dist1 = tl.where(take, dist, best_dist1)
+        best_idx1 = tl.where(take, 1, best_idx1)
+
+        dist = tl.abs(y1 - c2)
+        take = dist < best_dist1
+        best_dist1 = tl.where(take, dist, best_dist1)
+        best_idx1 = tl.where(take, 2, best_idx1)
+
+        dist = tl.abs(y1 - c3)
+        take = dist < best_dist1
+        best_dist1 = tl.where(take, dist, best_dist1)
+        best_idx1 = tl.where(take, 3, best_idx1)
+
+        dist = tl.abs(y1 - c4)
+        take = dist < best_dist1
+        best_dist1 = tl.where(take, dist, best_dist1)
+        best_idx1 = tl.where(take, 4, best_idx1)
+
+        dist = tl.abs(y1 - c5)
+        take = dist < best_dist1
+        best_dist1 = tl.where(take, dist, best_dist1)
+        best_idx1 = tl.where(take, 5, best_idx1)
+
+        dist = tl.abs(y1 - c6)
+        take = dist < best_dist1
+        best_dist1 = tl.where(take, dist, best_dist1)
+        best_idx1 = tl.where(take, 6, best_idx1)
+
+        dist = tl.abs(y1 - c7)
+        take = dist < best_dist1
+        best_idx1 = tl.where(take, 7, best_idx1)
+
+    packed = ((best_idx0.to(tl.uint8)) | ((best_idx1.to(tl.uint8)) << 4)).to(tl.uint8)
+    tl.store(PACKED_PTR + pid_m * stride_packed_m + pid_pair * stride_packed_d, packed)
+
+    if pid_pair == 0:
+        tl.store(NORMS_PTR + pid_m * stride_norm_m, norm)
+
+
+def fused_compress_mse(
+    x: torch.Tensor,
+    pi: torch.Tensor,
+    centroids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse normalize + rotate + nearest-centroid quantize + pack for TurboQuant MSE."""
+    lead_shape = x.shape[:-1]
+    d = int(x.shape[-1])
+    rows = x.numel() // d
+
+    x_flat = x.to(torch.float32).contiguous().view(rows, d)
+    pi32 = pi.to(x.device, dtype=torch.float32).contiguous()
+    centroids32 = centroids.to(x.device, dtype=torch.float32).contiguous()
+
+    packed_d = (d + 1) // 2
+    packed = torch.empty((rows, packed_d), dtype=torch.uint8, device=x.device)
+    norms = torch.empty((rows,), dtype=x.dtype, device=x.device)
+
+    grid = (rows, triton.cdiv(d, 2))
+    _fused_compress_mse_kernel[grid](
+        x_flat,
+        pi32,
+        centroids32,
+        packed,
+        norms,
+        x_flat.stride(0),
+        x_flat.stride(1),
+        packed.stride(0),
+        packed.stride(1),
+        norms.stride(0),
+        D=d,
+        num_warps=4,
+        num_stages=1,
+    )
+
+    return packed.view(*lead_shape, packed_d).view(torch.int8), norms.view(*lead_shape)
+
+
+@triton.jit
+def _score_only_turboquant_decode_kernel(
+    Q_ROT_ptr,
+    Q_SKETCH_ptr,
+    K_PACKED_ptr,
+    K_SCALES_ptr,
+    BLOCK_TABLE_ptr,
+    CONTEXT_LENS_ptr,
+    CODEBOOK_ptr,
+    SCORES_ptr,
+    stride_qr_s, stride_qr_h, stride_qr_d,
+    stride_qs_s, stride_qs_h, stride_qs_d,
+    stride_kp_b, stride_kp_s, stride_kp_h, stride_kp_d,
+    stride_ks_b, stride_ks_s, stride_ks_h, stride_ks_d,
+    stride_bt_s, stride_bt_b,
+    stride_sc_s, stride_sc_h, stride_sc_d,
+    num_kv_heads: tl.constexpr,
+    gqa_ratio: tl.constexpr,
+    D: tl.constexpr,
+    CACHE_D: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    SM_SCALE: tl.constexpr,
+    QJL_SCALE: tl.constexpr,
+):
+    seq_idx = tl.program_id(0)
+    hq_idx = tl.program_id(1)
+    block_idx = tl.program_id(2)
+
+    ctx_len = tl.load(CONTEXT_LENS_ptr + seq_idx)
+    num_blocks = tl.cdiv(ctx_len, BLOCK_SIZE)
+    if block_idx >= num_blocks:
+        return
+
+    hkv_idx = hq_idx // gqa_ratio
+    physical_block = tl.load(BLOCK_TABLE_ptr + seq_idx * stride_bt_s + block_idx * stride_bt_b)
+
+    start_t = block_idx * BLOCK_SIZE
+    offs_t = start_t + tl.arange(0, BLOCK_SIZE)
+    mask_t = offs_t < ctx_len
+
+    k_gamma = tl.load(
+        K_SCALES_ptr + physical_block * stride_ks_b + offs_t * stride_ks_s + hkv_idx * stride_ks_h + 0 * stride_ks_d,
+        mask=mask_t,
+        other=0.0,
+    )
+    k_norm = tl.load(
+        K_SCALES_ptr + physical_block * stride_ks_b + offs_t * stride_ks_s + hkv_idx * stride_ks_h + 1 * stride_ks_d,
+        mask=mask_t,
+        other=0.0,
+    )
+
+    score_mse = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    score_qjl = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+
+    for c in range(CACHE_D):
+        packed_k = tl.load(
+            K_PACKED_ptr + physical_block * stride_kp_b + offs_t * stride_kp_s + hkv_idx * stride_kp_h + c * stride_kp_d,
+            mask=mask_t,
+            other=0,
+        ).to(tl.int32)
+
+        n0 = packed_k & 0x0F
+        c0 = tl.load(CODEBOOK_ptr + (n0 >> 1), mask=mask_t, other=0.0)
+        q0_val = tl.where((n0 & 1) > 0, 1.0, -1.0)
+
+        d0 = c * 2
+        if d0 < D:
+            q_rot_d0 = tl.load(Q_ROT_ptr + seq_idx * stride_qr_s + hq_idx * stride_qr_h + d0 * stride_qr_d)
+            q_sketch_d0 = tl.load(Q_SKETCH_ptr + seq_idx * stride_qs_s + hq_idx * stride_qs_h + d0 * stride_qs_d)
+            score_mse += c0 * q_rot_d0
+            score_qjl += q0_val * q_sketch_d0
+
+        n1 = (packed_k >> 4) & 0x0F
+        c1 = tl.load(CODEBOOK_ptr + (n1 >> 1), mask=mask_t, other=0.0)
+        q1_val = tl.where((n1 & 1) > 0, 1.0, -1.0)
+
+        d1 = c * 2 + 1
+        if d1 < D:
+            q_rot_d1 = tl.load(Q_ROT_ptr + seq_idx * stride_qr_s + hq_idx * stride_qr_h + d1 * stride_qr_d)
+            q_sketch_d1 = tl.load(Q_SKETCH_ptr + seq_idx * stride_qs_s + hq_idx * stride_qs_h + d1 * stride_qs_d)
+            score_mse += c1 * q_rot_d1
+            score_qjl += q1_val * q_sketch_d1
+
+    scores = (score_mse * k_norm + score_qjl * k_gamma * QJL_SCALE) * SM_SCALE
+    scores = tl.where(mask_t, scores, float("-inf"))
+    tl.store(SCORES_ptr + seq_idx * stride_sc_s + hq_idx * stride_sc_h + offs_t * stride_sc_d, scores, mask=mask_t)
+
+
+@triton.jit
+def _fused_turboquant_attention_kernel(
+    Q_ROT_ptr,
+    Q_SKETCH_ptr,
+    K_PACKED_ptr,
+    K_SCALES_ptr,
+    V_PACKED_ptr,
+    V_SCALES_ptr,
+    BLOCK_TABLE_ptr,
+    CONTEXT_LENS_ptr,
+    CODEBOOK_ptr,
+    PI_ptr,
+    S_ptr,
+    OUT_ptr,
+    stride_qr_s, stride_qr_h, stride_qr_d,
+    stride_qs_s, stride_qs_h, stride_qs_d,
+    stride_kp_b, stride_kp_s, stride_kp_h, stride_kp_d,
+    stride_ks_b, stride_ks_s, stride_ks_h, stride_ks_d,
+    stride_vp_b, stride_vp_s, stride_vp_h, stride_vp_d,
+    stride_vs_b, stride_vs_s, stride_vs_h, stride_vs_d,
+    stride_bt_s, stride_bt_b,
+    stride_o_s, stride_o_h, stride_o_d,
+    num_kv_heads: tl.constexpr,
+    gqa_ratio: tl.constexpr,
+    D: tl.constexpr,
+    CACHE_D: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    OUT_BLOCK: tl.constexpr,
+    SM_SCALE: tl.constexpr,
+    QJL_SCALE: tl.constexpr,
+):
+    seq_idx = tl.program_id(0)
+    hq_idx = tl.program_id(1)
+    out_pid = tl.program_id(2)
+
+    hkv_idx = hq_idx // gqa_ratio
+    out_start = out_pid * OUT_BLOCK
+    out_offs = out_start + tl.arange(0, OUT_BLOCK)
+    out_mask = out_offs < D
+    d_offs = tl.arange(0, D)
+
+    ctx_len = tl.load(CONTEXT_LENS_ptr + seq_idx)
+    num_blocks = tl.cdiv(ctx_len, BLOCK_SIZE)
+
+    q_rot = tl.load(
+        Q_ROT_ptr + seq_idx * stride_qr_s + hq_idx * stride_qr_h + d_offs * stride_qr_d,
+        mask=d_offs < D,
+        other=0.0,
+    )
+    q_sketch = tl.load(
+        Q_SKETCH_ptr + seq_idx * stride_qs_s + hq_idx * stride_qs_h + d_offs * stride_qs_d,
+        mask=d_offs < D,
+        other=0.0,
+    )
+
+    m_i = -float("inf")
+    l_i = 0.0
+    acc = tl.zeros([OUT_BLOCK], dtype=tl.float32)
+
+    for block_idx in range(num_blocks):
+        physical_block = tl.load(BLOCK_TABLE_ptr + seq_idx * stride_bt_s + block_idx * stride_bt_b)
+        start_t = block_idx * BLOCK_SIZE
+        offs_t = start_t + tl.arange(0, BLOCK_SIZE)
+        mask_t = offs_t < ctx_len
+
+        k_gamma = tl.load(
+            K_SCALES_ptr + physical_block * stride_ks_b + offs_t * stride_ks_s + hkv_idx * stride_ks_h + 0 * stride_ks_d,
+            mask=mask_t,
+            other=0.0,
+        )
+        k_norm = tl.load(
+            K_SCALES_ptr + physical_block * stride_ks_b + offs_t * stride_ks_s + hkv_idx * stride_ks_h + 1 * stride_ks_d,
+            mask=mask_t,
+            other=0.0,
+        )
+
+        score_mse = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+        score_qjl = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+
+        for c in range(CACHE_D):
+            packed_k = tl.load(
+                K_PACKED_ptr + physical_block * stride_kp_b + offs_t * stride_kp_s + hkv_idx * stride_kp_h + c * stride_kp_d,
+                mask=mask_t,
+                other=0,
+            ).to(tl.int32)
+
+            n0 = packed_k & 0x0F
+            c0 = tl.load(CODEBOOK_ptr + (n0 >> 1), mask=mask_t, other=0.0)
+            q0_val = tl.where((n0 & 1) > 0, 1.0, -1.0)
+
+            d0 = c * 2
+            if d0 < D:
+                q_rot_d0 = tl.load(Q_ROT_ptr + seq_idx * stride_qr_s + hq_idx * stride_qr_h + d0 * stride_qr_d)
+                q_sketch_d0 = tl.load(Q_SKETCH_ptr + seq_idx * stride_qs_s + hq_idx * stride_qs_h + d0 * stride_qs_d)
+                score_mse += c0 * q_rot_d0
+                score_qjl += q0_val * q_sketch_d0
+
+            n1 = (packed_k >> 4) & 0x0F
+            c1 = tl.load(CODEBOOK_ptr + (n1 >> 1), mask=mask_t, other=0.0)
+            q1_val = tl.where((n1 & 1) > 0, 1.0, -1.0)
+
+            d1 = c * 2 + 1
+            if d1 < D:
+                q_rot_d1 = tl.load(Q_ROT_ptr + seq_idx * stride_qr_s + hq_idx * stride_qr_h + d1 * stride_qr_d)
+                q_sketch_d1 = tl.load(Q_SKETCH_ptr + seq_idx * stride_qs_s + hq_idx * stride_qs_h + d1 * stride_qs_d)
+                score_mse += c1 * q_rot_d1
+                score_qjl += q1_val * q_sketch_d1
+
+        scores = (score_mse * k_norm + score_qjl * k_gamma * QJL_SCALE) * SM_SCALE
+        scores = tl.where(mask_t, scores, float("-inf"))
+
+        m_new = tl.maximum(m_i, tl.max(scores, 0))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new)
+
+        l_i = l_i * alpha + tl.sum(p, 0)
+        acc = acc * alpha
+
+        v_gamma = tl.load(
+            V_SCALES_ptr + physical_block * stride_vs_b + offs_t * stride_vs_s + hkv_idx * stride_vs_h + 0 * stride_vs_d,
+            mask=mask_t,
+            other=0.0,
+        )
+        v_norm = tl.load(
+            V_SCALES_ptr + physical_block * stride_vs_b + offs_t * stride_vs_s + hkv_idx * stride_vs_h + 1 * stride_vs_d,
+            mask=mask_t,
+            other=0.0,
+        )
+
+        v_mse = tl.zeros([BLOCK_SIZE, OUT_BLOCK], dtype=tl.float32)
+        v_qjl = tl.zeros([BLOCK_SIZE, OUT_BLOCK], dtype=tl.float32)
+
+        for c in range(CACHE_D):
+            packed_v = tl.load(
+                V_PACKED_ptr + physical_block * stride_vp_b + offs_t * stride_vp_s + hkv_idx * stride_vp_h + c * stride_vp_d,
+                mask=mask_t,
+                other=0,
+            ).to(tl.int32)
+
+            n0 = packed_v & 0x0F
+            c0 = tl.load(CODEBOOK_ptr + (n0 >> 1), mask=mask_t, other=0.0)
+            q0_val = tl.where((n0 & 1) > 0, 1.0, -1.0)
+
+            d0 = c * 2
+            if d0 < D:
+                pi_row = tl.load(PI_ptr + d0 * D + out_offs, mask=out_mask, other=0.0)
+                s_row = tl.load(S_ptr + d0 * D + out_offs, mask=out_mask, other=0.0)
+                v_mse += c0[:, None] * pi_row[None, :]
+                v_qjl += q0_val[:, None] * s_row[None, :]
+
+            n1 = (packed_v >> 4) & 0x0F
+            c1 = tl.load(CODEBOOK_ptr + (n1 >> 1), mask=mask_t, other=0.0)
+            q1_val = tl.where((n1 & 1) > 0, 1.0, -1.0)
+
+            d1 = c * 2 + 1
+            if d1 < D:
+                pi_row = tl.load(PI_ptr + d1 * D + out_offs, mask=out_mask, other=0.0)
+                s_row = tl.load(S_ptr + d1 * D + out_offs, mask=out_mask, other=0.0)
+                v_mse += c1[:, None] * pi_row[None, :]
+                v_qjl += q1_val[:, None] * s_row[None, :]
+
+        v_dequant = (v_mse + (v_gamma[:, None] * QJL_SCALE) * v_qjl) * v_norm[:, None]
+        acc += tl.sum(p[:, None] * v_dequant, 0)
+
+        m_i = m_new
+
+    acc = acc / l_i
+    tl.store(
+        OUT_ptr + seq_idx * stride_o_s + hq_idx * stride_o_h + out_offs * stride_o_d,
+        acc,
+        mask=out_mask,
+    )
+
+
+def fused_score(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    k_scales: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    scale: float,
+    num_kv_heads: int,
+    pi: torch.Tensor,
+    codebook: torch.Tensor,
+    s: torch.Tensor,
+) -> torch.Tensor:
+    q = q.float().contiguous()
+    q_rot = (q @ pi.t().to(q.device, q.dtype)).contiguous()
+    q_sketch = (q @ s.t().to(q.device, q.dtype)).contiguous()
+    num_seqs, num_heads, head_dim = q.shape
+    cache_dim = int(k_cache.shape[-1])
+    scores = torch.full(
+        (num_seqs, num_heads, int(block_tables.shape[1]) * int(k_cache.shape[1])),
+        float("-inf"),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    _score_only_turboquant_decode_kernel[(num_seqs, num_heads, int(block_tables.shape[1]))](
+        q_rot,
+        q_sketch,
+        k_cache,
+        k_scales,
+        block_tables,
+        context_lens,
+        codebook,
+        scores,
+        q_rot.stride(0), q_rot.stride(1), q_rot.stride(2),
+        q_sketch.stride(0), q_sketch.stride(1), q_sketch.stride(2),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
+        k_scales.stride(0), k_scales.stride(1), k_scales.stride(2), k_scales.stride(3),
+        block_tables.stride(0), block_tables.stride(1),
+        scores.stride(0), scores.stride(1), scores.stride(2),
+        num_kv_heads=num_kv_heads,
+        gqa_ratio=num_heads // num_kv_heads,
+        D=head_dim,
+        CACHE_D=cache_dim,
+        BLOCK_SIZE=int(k_cache.shape[1]),
+        SM_SCALE=scale,
+        QJL_SCALE=math.sqrt(math.pi / 2.0) / float(head_dim),
+        num_warps=2,
+        num_stages=1,
+    )
+    return scores
+
+
+def fused_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scales: torch.Tensor,
+    v_scales: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    scale: float,
+    num_kv_heads: int,
+    quantizer,
+    pi: torch.Tensor,
+    codebook: torch.Tensor,
+    s: torch.Tensor,
+) -> torch.Tensor:
+    orig_dtype = q.dtype
+    num_seqs, num_heads, head_dim = q.shape
+    q = q.float().contiguous()
+    q_rot = (q @ pi.t().to(q.device, q.dtype)).contiguous()
+    q_sketch = (q @ s.t().to(q.device, q.dtype)).contiguous()
+
+    block_size = int(k_cache.shape[1])
+    cache_dim = int(k_cache.shape[-1])
+    out_block = 32
+    num_out_blocks = triton.cdiv(head_dim, out_block)
+
+    out = torch.empty((num_seqs, num_heads, head_dim), device=q.device, dtype=torch.float32)
+    _fused_turboquant_attention_kernel[(num_seqs, num_heads, num_out_blocks)](
+        q_rot,
+        q_sketch,
+        k_cache,
+        k_scales,
+        v_cache,
+        v_scales,
+        block_tables,
+        context_lens,
+        codebook,
+        pi,
+        s,
+        out,
+        q_rot.stride(0), q_rot.stride(1), q_rot.stride(2),
+        q_sketch.stride(0), q_sketch.stride(1), q_sketch.stride(2),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
+        k_scales.stride(0), k_scales.stride(1), k_scales.stride(2), k_scales.stride(3),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
+        v_scales.stride(0), v_scales.stride(1), v_scales.stride(2), v_scales.stride(3),
+        block_tables.stride(0), block_tables.stride(1),
+        out.stride(0), out.stride(1), out.stride(2),
+        num_kv_heads=num_kv_heads,
+        gqa_ratio=num_heads // num_kv_heads,
+        D=head_dim,
+        CACHE_D=cache_dim,
+        BLOCK_SIZE=block_size,
+        OUT_BLOCK=out_block,
+        SM_SCALE=scale,
+        QJL_SCALE=math.sqrt(math.pi / 2.0) / float(head_dim),
+        num_warps=2,
+        num_stages=1,
+    )
+    return out.to(orig_dtype)
+
+
+def fused_quantized_decode_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scales: torch.Tensor,
+    v_scales: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    scale: float,
+    num_kv_heads: int,
+    quantizer,
+    pi: torch.Tensor,
+    codebook: torch.Tensor,
+    s: torch.Tensor,
+) -> torch.Tensor:
+    return fused_attention(
+        q,
+        k_cache,
+        v_cache,
+        k_scales,
+        v_scales,
+        block_tables,
+        context_lens,
+        scale,
+        num_kv_heads,
+        quantizer,
+        pi,
+        codebook,
+        s,
+    )

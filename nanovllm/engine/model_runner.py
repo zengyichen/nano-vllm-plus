@@ -24,6 +24,10 @@ class ModelRunner:
         self.rank = rank
         self.event = event
         self.quantizer = get_kv_quantizer(config)
+        if self.quantizer is not None and not self.enforce_eager:
+            # TurboQuant decode path performs dynamic token gather/dequant,
+            # which is not compatible with static CUDA graph capture.
+            self.enforce_eager = True
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         backend = "nccl" if device == "cuda" else "gloo"
@@ -170,7 +174,7 @@ class ModelRunner:
             if self.quantizer:
                 kv_size += self.kv_scales.element_size() * self.kv_scales.nelement()
             print(f"[VRAM] KV Cache: {kv_size / 1024**3:.2f} GB")
-            if self.quantizer:
+            if self.quantizer and block_transient_bytes > 0:
                 reserved_tmp = config.num_kvcache_blocks * block_transient_bytes
                 print(f"[VRAM] KV Dequant Workspace(Est.): {reserved_tmp / 1024**3:.2f} GB")
             
@@ -179,6 +183,31 @@ class ModelRunner:
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
+
+    def _build_quant_slot_mapping(
+        self,
+        block_tables: torch.Tensor,
+        seqlens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        seqlens_i32 = seqlens.to(dtype=torch.int32)
+        cu_seqlens_k = torch.empty(seqlens_i32.numel() + 1, device=block_tables.device, dtype=torch.int32)
+        cu_seqlens_k[0] = 0
+        cu_seqlens_k[1:] = torch.cumsum(seqlens_i32, dim=0)
+
+        max_blocks = int(block_tables.shape[1])
+        if max_blocks == 0:
+            return torch.empty(0, device=block_tables.device, dtype=torch.int64), cu_seqlens_k
+
+        max_seqlen_upper = max_blocks * int(self.block_size)
+        pos = torch.arange(max_seqlen_upper, device=block_tables.device, dtype=torch.int64)
+        block_idx = torch.div(pos, self.block_size, rounding_mode="floor")
+        block_off = pos - block_idx * self.block_size
+
+        block_ids = block_tables.to(torch.int64).index_select(1, block_idx)
+        slots = block_ids * self.block_size + block_off
+        valid = pos.unsqueeze(0) < seqlens_i32.to(torch.int64).unsqueeze(1)
+        slot_mapping = slots[valid]
+        return slot_mapping, cu_seqlens_k
 
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
@@ -215,7 +244,28 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+
+        quant_slot_mapping = None
+        quant_cu_seqlens_k = None
+        quant_max_seqlen_k = 0
+        if self.quantizer and block_tables is not None:
+            seqlens_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+            quant_slot_mapping, quant_cu_seqlens_k = self._build_quant_slot_mapping(block_tables, seqlens_k)
+            quant_max_seqlen_k = max_seqlen_k
+
+        set_context(
+            True,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            slot_mapping,
+            None,
+            block_tables,
+            quant_slot_mapping=quant_slot_mapping,
+            quant_cu_seqlens_k=quant_cu_seqlens_k,
+            quant_max_seqlen_k=quant_max_seqlen_k,
+        )
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -232,8 +282,26 @@ class ModelRunner:
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.arange(0, input_ids.numel() + 1, device=input_ids.device, dtype=torch.int32)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+
+        quant_slot_mapping = None
+        quant_cu_seqlens_k = None
+        quant_max_seqlen_k = 0
+        if self.quantizer:
+            quant_slot_mapping, quant_cu_seqlens_k = self._build_quant_slot_mapping(block_tables, context_lens)
+            quant_max_seqlen_k = int(block_tables.shape[1]) * int(self.block_size)
+
+        set_context(
+            False,
+            cu_seqlens_q=cu_seqlens_q,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            quant_slot_mapping=quant_slot_mapping,
+            quant_cu_seqlens_k=quant_cu_seqlens_k,
+            quant_max_seqlen_k=quant_max_seqlen_k,
+        )
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):

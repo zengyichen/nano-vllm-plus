@@ -9,7 +9,7 @@ from random import randint, seed
 from nanovllm import LLM, SamplingParams
 
 
-def run_benchmark(llm_name, llm, num_seqs=256, max_input_len=1024, max_output_len=1024):
+def run_benchmark(llm_name, llm, num_seqs=16, max_input_len=128, max_output_len=1024):
     print(f"\n--- Running benchmark: {llm_name} ---")
     seed(0)
     prompt_token_ids = [
@@ -36,8 +36,8 @@ def run_single_mode(mode: str, model_path: str) -> float:
     kwargs = dict(enforce_eager=False, max_model_len=4096)
     name = "Baseline"
     if mode == "quant":
-        kwargs.update(kv_quant_algo="turboquant", kv_quant_bits=3)
-        name = "TurboQuant_3bit"
+        kwargs.update(kv_quant_algo="turboquant", kv_quant_bits=4)
+        name = "TurboQuant_4bit_prod"
 
     llm = None
     try:
@@ -78,10 +78,10 @@ def main():
     print("========================================")
     print("Baseline (No Quantization)")
     print("========================================")
-    # throughput_baseline = run_mode_subprocess("baseline", args.model)
+    throughput_baseline = run_mode_subprocess("baseline", args.model)
 
     print("========================================")
-    print("TurboQuant Prod 3-bit Quantization")
+    print("TurboQuant Prod 4-bit Quantization")
     print("========================================")
     throughput_quant = run_mode_subprocess("quant", args.model)
 
@@ -89,7 +89,7 @@ def main():
     print("Benchmark Comparison Summary")
     print("========================================")
     print(f"Baseline Throughput : {throughput_baseline:.2f} tok/s")
-    print(f"TurboQuant 3-bit    : {throughput_quant:.2f} tok/s")
+    print(f"TurboQuant 4-bit    : {throughput_quant:.2f} tok/s")
 
     if throughput_baseline > 0 and throughput_quant > 0:
         ratio = throughput_quant / throughput_baseline
