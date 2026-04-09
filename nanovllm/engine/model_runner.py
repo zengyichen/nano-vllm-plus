@@ -1,3 +1,4 @@
+import math
 import pickle
 import torch
 import torch.distributed as dist
@@ -37,6 +38,9 @@ class ModelRunner:
         self.kv_v_cache = None
         self.kv_v_scales = None
         self.kv_v_zeros = None
+        self.warmup_activation_bytes = 0
+        self.warmup_peak_bytes = 0
+        self.warmup_current_bytes = 0
         if self.quantizer is not None and self.quant_decode_backend == "auto":
             if hasattr(self.quantizer, "quantize_k") and hasattr(self.quantizer, "quantize_v"):
                 self.quant_decode_backend = "asym_turboquant"
@@ -119,11 +123,22 @@ class ModelRunner:
 
     def warmup_model(self):
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+
+        # First pass triggers one-off compile/autotune paths.
+        torch.cuda.reset_peak_memory_stats()
         self.run(seqs, True)
+        torch.cuda.empty_cache()
+
+        # Second pass approximates steady-state activation peak for allocator reserve.
+        torch.cuda.reset_peak_memory_stats()
+        self.run(seqs, True)
+        stats = torch.cuda.memory_stats()
+        self.warmup_peak_bytes = int(stats["allocated_bytes.all.peak"])
+        self.warmup_current_bytes = int(stats["allocated_bytes.all.current"])
+        self.warmup_activation_bytes = max(0, self.warmup_peak_bytes - self.warmup_current_bytes)
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
@@ -131,8 +146,7 @@ class ModelRunner:
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        model_allocated = int(torch.cuda.memory_stats()["allocated_bytes.all.current"])
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         dtype_size = torch.empty((), dtype=hf_config.torch_dtype).element_size()
@@ -164,9 +178,56 @@ class ModelRunner:
             block_transient_bytes = 0
             block_bytes = block_persistent_bytes
 
-        available_bytes = int(total * config.gpu_memory_utilization - used - peak + current)
+        workspace_reserve_bytes = 0
+        if self.quantizer and self.quant_decode_backend in {"dequant_flash", "asym_turboquant"}:
+            workspace_bytes = int(config.kv_decode_workspace_mb) * 1024 * 1024
+            per_token_bytes = 2 * int(num_kv_heads) * int(head_dim) * int(dtype_size)
+            max_tokens = int(config.max_num_seqs) * int(config.max_model_len)
+            if workspace_bytes > 0:
+                workspace_reserve_bytes = min(workspace_bytes, max_tokens * max(1, per_token_bytes))
+
+        safety_margin_bytes = int(config.kv_allocator_safety_margin_mb) * 1024 * 1024
+        activation_cap_bytes = int(config.kv_activation_peak_reserve_mb) * 1024 * 1024
+        activation_reserve_bytes = min(int(self.warmup_activation_bytes), activation_cap_bytes)
+
+        available_bytes = int(total * config.gpu_memory_utilization)
+        available_bytes -= int(used)
+        available_bytes -= safety_margin_bytes
+        available_bytes -= activation_reserve_bytes
+        available_bytes -= workspace_reserve_bytes
         config.num_kvcache_blocks = available_bytes // int(block_bytes)
-        assert config.num_kvcache_blocks > 0
+        assert config.num_kvcache_blocks > 0, (
+            f"No VRAM available for KV Cache: available={available_bytes / 1024**2:.1f}MB, "
+            f"block={block_bytes / 1024**2:.2f}MB"
+        )
+
+        # Keep runtime scheduling self-consistent: requested max_model_len must fit KV blocks.
+        effective_num_seqs = max(
+            1,
+            min(
+                int(config.max_num_seqs),
+                int(config.max_num_batched_tokens) // max(1, int(config.max_model_len)),
+            ),
+        )
+        min_blocks_required = effective_num_seqs * math.ceil(int(config.max_model_len) / int(self.block_size))
+        if config.num_kvcache_blocks < min_blocks_required:
+            max_len_by_blocks = (config.num_kvcache_blocks // effective_num_seqs) * int(self.block_size)
+            assert max_len_by_blocks > 0, "No KV blocks left after VRAM reservation"
+            if self.rank == 0:
+                print(
+                    f"[Warning] Requested max_model_len={config.max_model_len} exceeds KV capacity. "
+                    f"Clamping to {max_len_by_blocks}."
+                )
+            config.max_model_len = int(max_len_by_blocks)
+
+        max_batched_tokens_by_blocks = (config.num_kvcache_blocks // effective_num_seqs) * int(self.block_size) * effective_num_seqs
+        if int(config.max_num_batched_tokens) > int(max_batched_tokens_by_blocks):
+            if self.rank == 0:
+                print(
+                    f"[Warning] Requested max_num_batched_tokens={config.max_num_batched_tokens} exceeds KV capacity. "
+                    f"Clamping to {max_batched_tokens_by_blocks}."
+                )
+            config.max_num_batched_tokens = int(max_batched_tokens_by_blocks)
         
         # Allocate KV Cache
         if self.quantizer and hasattr(self.quantizer, "allocate_cache_split"):
@@ -256,8 +317,13 @@ class ModelRunner:
                 layer_id += 1
 
         if self.rank == 0:
-            print(f"[VRAM] Model Weights: {current / 1024**3:.2f} GB")
-            print(f"[VRAM] Activations (Peak): {(peak - current) / 1024**3:.2f} GB")
+            print(f"[VRAM] Model Weights: {model_allocated / 1024**3:.2f} GB")
+            print(f"[VRAM] Activations (Warmup Peak): {self.warmup_activation_bytes / 1024**3:.2f} GB")
+            print(f"[VRAM] Safety Margin: {safety_margin_bytes / 1024**3:.2f} GB")
+            if activation_reserve_bytes > 0:
+                print(f"[VRAM] Activation Reserve: {activation_reserve_bytes / 1024**3:.2f} GB")
+            if workspace_reserve_bytes > 0:
+                print(f"[VRAM] Decode Workspace Reserve: {workspace_reserve_bytes / 1024**3:.2f} GB")
             
             if self.split_kv_cache:
                 kv_k_size = self.kv_k_cache.element_size() * self.kv_k_cache.nelement()
@@ -496,7 +562,12 @@ class ModelRunner:
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
+        max_bs = min(int(self.config.max_num_seqs), int(self.config.cuda_graph_max_bs), 512)
+        if int(config.max_model_len) >= 4096:
+            total_memory = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+            # On low-VRAM cards, large graph captures waste memory for long-context runs.
+            if total_memory <= 10 * 1024**3:
+                max_bs = min(max_bs, 32)
         quant_graph_enabled = (
             self.quantizer is not None
             and self.quant_decode_backend in {"dequant_flash", "asym_turboquant"}

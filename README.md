@@ -26,10 +26,10 @@ pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 
 To download the model weights manually, use the following command:
 ```bash
-huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
-  --local-dir-use-symlinks False
+hf download Qwen/Qwen3-8B-AWQ --local-dir ~/huggingface/Qwen3-8B-AWQ/
 ```
+
+AWQ checkpoints are detected automatically from `config.json` and use the packed-weight path in nano-vLLM.
 
 ## Quick Start
 

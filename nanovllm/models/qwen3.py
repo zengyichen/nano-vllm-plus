@@ -4,11 +4,39 @@ import torch.distributed as dist
 from transformers import Qwen3Config
 
 from nanovllm.layers.activation import SiluAndMul
+from nanovllm.layers.awq_linear import AWQMergedColumnParallelLinear, AWQQKVParallelLinear, AWQRowParallelLinear
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+
+
+def _quantization_config(config: Qwen3Config):
+    quant_config = getattr(config, "quantization_config", None)
+    if quant_config is None:
+        return None
+    if isinstance(quant_config, dict):
+        return quant_config
+    quant_dict = {}
+    for key in ("quant_method", "quantization_method", "group_size", "q_group_size", "bits", "w_bit"):
+        if hasattr(quant_config, key):
+            quant_dict[key] = getattr(quant_config, key)
+    return quant_dict
+
+
+def _is_awq_quantized(config: Qwen3Config) -> bool:
+    quant_config = _quantization_config(config)
+    if quant_config is None:
+        return False
+    method = str(quant_config.get("quant_method") or quant_config.get("quantization_method") or "").lower()
+    return method == "awq"
+
+
+def _awq_group_size(config: Qwen3Config) -> int:
+    quant_config = _quantization_config(config) or {}
+    group_size = quant_config.get("group_size") or quant_config.get("q_group_size") or 128
+    return int(group_size)
 
 
 class Qwen3Attention(nn.Module):
@@ -24,6 +52,8 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
+        quantized: bool = False,
+        awq_group_size: int = 128,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -39,24 +69,39 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=qkv_bias,
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            hidden_size,
-            bias=False,
-        )
+        if quantized:
+            self.qkv_proj = AWQQKVParallelLinear(
+                hidden_size,
+                self.total_num_heads * self.head_dim,
+                self.total_num_kv_heads * self.head_dim,
+                awq_group_size,
+                bias=qkv_bias,
+            )
+            self.o_proj = AWQRowParallelLinear(
+                self.total_num_heads * self.head_dim,
+                hidden_size,
+                awq_group_size,
+                bias=False,
+            )
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=qkv_bias,
+            )
+            self.o_proj = RowParallelLinear(
+                self.total_num_heads * self.head_dim,
+                hidden_size,
+                bias=False,
+            )
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position,
             base=rope_theta,
-            rope_scaling=rope_scaling,
+            rope_scaling=None,
         )
         self.attn = Attention(
             self.num_heads,
@@ -94,18 +139,24 @@ class Qwen3MLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
+        quantized: bool = False,
+        awq_group_size: int = 128,
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-        )
+        if quantized:
+            self.gate_up_proj = AWQMergedColumnParallelLinear(hidden_size, intermediate_size, awq_group_size, bias=False)
+            self.down_proj = AWQRowParallelLinear(intermediate_size, hidden_size, awq_group_size, bias=False)
+        else:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [intermediate_size] * 2,
+                bias=False,
+            )
+            self.down_proj = RowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=False,
+            )
         assert hidden_act == "silu"
         self.act_fn = SiluAndMul()
 
@@ -121,6 +172,8 @@ class Qwen3DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Qwen3Config,
+        quantized: bool = False,
+        awq_group_size: int = 128,
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(
@@ -133,11 +186,15 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            quantized=quantized,
+            awq_group_size=awq_group_size,
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
+            quantized=quantized,
+            awq_group_size=awq_group_size,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -163,10 +220,14 @@ class Qwen3Model(nn.Module):
     def __init__(
         self,
         config: Qwen3Config,
+        quantized: bool = False,
+        awq_group_size: int = 128,
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList(
+            [Qwen3DecoderLayer(config, quantized=quantized, awq_group_size=awq_group_size) for _ in range(config.num_hidden_layers)]
+        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -196,7 +257,9 @@ class Qwen3ForCausalLM(nn.Module):
         config: Qwen3Config
     ) -> None:
         super().__init__()
-        self.model = Qwen3Model(config)
+        quantized = _is_awq_quantized(config)
+        awq_group_size = _awq_group_size(config) if quantized else 128
+        self.model = Qwen3Model(config, quantized=quantized, awq_group_size=awq_group_size)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data

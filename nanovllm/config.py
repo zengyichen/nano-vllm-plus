@@ -23,6 +23,9 @@ class Config:
     kv_decode_graph: bool = False
     kv_v_bits: int = 4
     kv_v_group_size: int = 32
+    kv_allocator_safety_margin_mb: int = 256
+    kv_activation_peak_reserve_mb: int = 512
+    cuda_graph_max_bs: int = 512
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -35,6 +38,9 @@ class Config:
         self.kv_decode_graph = bool(self.kv_decode_graph)
         assert self.kv_v_bits in {2, 4}
         assert self.kv_v_group_size > 0 and self.kv_v_group_size % 2 == 0
+        assert self.kv_allocator_safety_margin_mb >= 0
+        assert self.kv_activation_peak_reserve_mb >= 0
+        assert self.cuda_graph_max_bs >= 1
         is_asym_quant = kv_quant_algo in {"asym_turboquant", "asym"}
         if self.kv_decode_backend == "asym_turboquant" or is_asym_quant:
             assert self.kv_quant_bits == 4, "asym_turboquant currently supports only 4-bit K"
