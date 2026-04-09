@@ -1,3 +1,5 @@
+# pyright: reportInvalidTypeForm=false
+
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -85,6 +87,15 @@ def _awq_matmul_chunked(
 
 
 if _TRITON_AWQ_AVAILABLE:
+    @triton.autotune(
+        configs=[
+            triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32, 'SPLIT_K': 1}, num_warps=4, num_stages=4),
+            triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 64, 'SPLIT_K': 1}, num_warps=4, num_stages=4),
+            triton.Config({'BLOCK_M': 1, 'BLOCK_N': 128, 'BLOCK_K': 64, 'SPLIT_K': 4}, num_warps=4, num_stages=3),
+            triton.Config({'BLOCK_M': 1, 'BLOCK_N': 64, 'BLOCK_K': 128, 'SPLIT_K': 8}, num_warps=4, num_stages=3),
+        ],
+        key=['M', 'N', 'K']
+    )
     @triton.jit
     def _awq_fused_matmul_kernel(
         x_ptr,
@@ -109,9 +120,11 @@ if _TRITON_AWQ_AVAILABLE:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
+        SPLIT_K: tl.constexpr,
     ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
+        pid_k = tl.program_id(2)
 
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -125,7 +138,7 @@ if _TRITON_AWQ_AVAILABLE:
 
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        for k_start in range(0, K, BLOCK_K):
+        for k_start in range(pid_k * BLOCK_K, K, BLOCK_K * SPLIT_K):
             offs_k = k_start + tl.arange(0, BLOCK_K)
             mask_k = offs_k < K
             mask_x = mask_m[:, None] & mask_k[None, :]
@@ -146,12 +159,17 @@ if _TRITON_AWQ_AVAILABLE:
 
             w_q = (w_packed >> shifts[None, :]) & 0xF
             z_q = (z_packed >> shifts[None, :]) & 0xF
-            w_f16 = (w_q.to(tl.float16) - z_q.to(tl.float16)) * scales.to(tl.float16)
+            w_f16 = (w_q.to(tl.int32) - z_q.to(tl.int32)).to(tl.float16) * scales.to(tl.float16)
 
-            acc = tl.dot(x_block, w_f16, acc)
+            acc = tl.dot(x_block, w_f16, acc, out_dtype=tl.float32)
 
         out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
-        tl.store(out_ptrs, acc.to(tl.float16), mask=mask_m[:, None] & mask_n[None, :])
+        out_mask = mask_m[:, None] & mask_n[None, :]
+
+        if SPLIT_K == 1:
+            tl.store(out_ptrs, acc.to(tl.float16), mask=out_mask)
+        else:
+            tl.atomic_add(out_ptrs, acc.to(tl.float16), mask=out_mask)
 
 
 def _awq_matmul_triton(
@@ -164,12 +182,13 @@ def _awq_matmul_triton(
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     m, k = x_2d.shape
     n = int(scales.shape[1])
-    out_2d = torch.empty((m, n), device=x.device, dtype=x.dtype)
+    out_2d = torch.zeros((m, n), device=x.device, dtype=x.dtype)
 
-    block_m = 64
-    block_n = 64
-    block_k = 32
-    grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
+    grid = lambda META: (
+        triton.cdiv(m, META['BLOCK_M']),
+        triton.cdiv(n, META['BLOCK_N']),
+        META['SPLIT_K'],
+    )
 
     _awq_fused_matmul_kernel[grid](
         x_2d,
@@ -191,9 +210,6 @@ def _awq_matmul_triton(
         k,
         n,
         GROUP_SIZE=group_size,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
     )
     return out_2d.view(*x.shape[:-1], n)
 
