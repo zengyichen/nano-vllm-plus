@@ -9,7 +9,7 @@ from random import randint, seed
 from nanovllm import LLM, SamplingParams
 
 
-def run_benchmark(llm_name, llm, num_seqs=1, max_input_len=128, max_output_len=1024):
+def run_benchmark(llm_name, llm, num_seqs=1, max_input_len=64, max_output_len=128):
     print(f"\n--- Running benchmark: {llm_name} ---")
     seed(0)
     prompt_token_ids = [
