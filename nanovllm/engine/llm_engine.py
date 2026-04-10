@@ -3,6 +3,7 @@ from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
@@ -17,28 +18,41 @@ class LLMEngine:
     def __init__(self, model, **kwargs):
         self.model_runner = None
         self._exited = False
+        self._atexit_callback = None
+        self.ps = []
+        self.events = []
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
-        self.ps = []
-        self.events = []
-        ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
-            process.start()
-            self.ps.append(process)
-            self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        config.eos = self.tokenizer.eos_token_id
-        self.scheduler = Scheduler(config)
-        atexit.register(self.exit)
+        try:
+            ctx = mp.get_context("spawn")
+            for i in range(1, config.tensor_parallel_size):
+                event = ctx.Event()
+                process = ctx.Process(target=ModelRunner, args=(config, i, event))
+                process.start()
+                self.ps.append(process)
+                self.events.append(event)
+            self.model_runner = ModelRunner(config, 0, self.events)
+            self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+            config.eos = self.tokenizer.eos_token_id
+            self.scheduler = Scheduler(config)
+            self._atexit_callback = self.exit
+            atexit.register(self._atexit_callback)
+        except Exception:
+            self._cleanup_partial_init()
+            raise
 
     def exit(self):
         if self._exited:
             return
         self._exited = True
+
+        if self._atexit_callback is not None:
+            try:
+                atexit.unregister(self._atexit_callback)
+            except Exception:
+                pass
+            self._atexit_callback = None
 
         if self.model_runner is not None:
             self.model_runner.call("exit")
@@ -46,6 +60,25 @@ class LLMEngine:
 
         for p in self.ps:
             p.join()
+
+    def _cleanup_partial_init(self):
+        if self.model_runner is not None:
+            try:
+                self.model_runner.call("exit")
+            except Exception:
+                pass
+            self.model_runner = None
+
+        for p in self.ps:
+            if p.is_alive():
+                p.terminate()
+            p.join()
+
+        if dist.is_available() and dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):

@@ -41,6 +41,7 @@ class ModelRunner:
         self.warmup_activation_bytes = 0
         self.warmup_peak_bytes = 0
         self.warmup_current_bytes = 0
+        self.model_weight_bytes = 0
         if self.quantizer is not None and self.quant_decode_backend == "auto":
             if hasattr(self.quantizer, "quantize_k") and hasattr(self.quantizer, "quantize_v"):
                 self.quant_decode_backend = "asym_turboquant"
@@ -55,30 +56,45 @@ class ModelRunner:
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         backend = "nccl" if device == "cuda" else "gloo"
-        dist.init_process_group(backend, "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        if device == "cuda":
-            torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)
-        torch.set_default_device(device)
-        self.model = Qwen3ForCausalLM(hf_config)
-        load_model(self.model, config.model)
-        self.sampler = Sampler()
-        self.warmup_model()
-        self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
-        torch.set_default_device("cpu")
-        torch.set_default_dtype(default_dtype)
+        dist_initialized = False
+        try:
+            dist.init_process_group(backend, "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+            dist_initialized = True
+            if device == "cuda":
+                torch.cuda.set_device(rank)
+            torch.set_default_dtype(hf_config.torch_dtype)
+            torch.set_default_device(device)
+            self.model = Qwen3ForCausalLM(hf_config)
+            load_model(self.model, config.model)
+            self.model_weight_bytes = int(
+                sum(p.numel() * p.element_size() for p in self.model.parameters())
+                + sum(b.numel() * b.element_size() for b in self.model.buffers())
+            )
+            self.sampler = Sampler()
+            self.warmup_model()
+            self.allocate_kv_cache()
+            if not self.enforce_eager:
+                self.capture_cudagraph()
 
-        if self.world_size > 1:
-            if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-                dist.barrier()
-            else:
-                dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
-                self.loop()
+            if self.world_size > 1:
+                if rank == 0:
+                    self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                    dist.barrier()
+                else:
+                    dist.barrier()
+                    self.shm = SharedMemory(name="nanovllm")
+                    self.loop()
+        except Exception:
+            if dist_initialized and dist.is_available() and dist.is_initialized():
+                try:
+                    dist.destroy_process_group()
+                except Exception:
+                    pass
+            raise
+        finally:
+            torch.set_default_device("cpu")
+            torch.set_default_dtype(default_dtype)
 
     def exit(self):
         if self.world_size > 1:
@@ -317,7 +333,8 @@ class ModelRunner:
                 layer_id += 1
 
         if self.rank == 0:
-            print(f"[VRAM] Model Weights: {model_allocated / 1024**3:.2f} GB")
+            print(f"[VRAM] Model Weights (Static): {self.model_weight_bytes / 1024**3:.2f} GB")
+            print(f"[VRAM] Runtime Allocated (Pre-KV): {model_allocated / 1024**3:.2f} GB")
             print(f"[VRAM] Activations (Warmup Peak): {self.warmup_activation_bytes / 1024**3:.2f} GB")
             print(f"[VRAM] Safety Margin: {safety_margin_bytes / 1024**3:.2f} GB")
             if activation_reserve_bytes > 0:
