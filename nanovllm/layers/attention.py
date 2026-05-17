@@ -387,8 +387,11 @@ class Attention(nn.Module):
         if k_cache.numel() and v_cache.numel():
             if self.quantizer:
                 if hasattr(self.quantizer, "quantize_k") and hasattr(self.quantizer, "quantize_v"):
-                    q_k, scale_k = self.quantizer.quantize_k(k)
-                    q_v, scale_v, zero_v = self.quantizer.quantize_v(v)
+                    if hasattr(self.quantizer, "quantize_kv"):
+                        q_k, scale_k, q_v, scale_v, zero_v = self.quantizer.quantize_kv(k, v)
+                    else:
+                        q_k, scale_k = self.quantizer.quantize_k(k)
+                        q_v, scale_v, zero_v = self.quantizer.quantize_v(v)
                     store_kvcache(q_k, q_v, k_cache, v_cache, context.slot_mapping)
                     store_tensor(scale_k, k_scales, context.slot_mapping)
                     if self.v_zeros is not None:

@@ -323,6 +323,16 @@ def _triton_quantize_prod4(
     return packed, gamma, norm
 
 
+def _fused_turboquant_and_cache_kernel(
+    tensor: torch.Tensor,
+    pi: torch.Tensor,
+    codebook: torch.Tensor,
+    s: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Single entrypoint for K quantization + packing used by KV cache writers.
+    return _triton_quantize_prod4(tensor, pi, codebook, s)
+
+
 def _triton_dequantize_prod4(
     q_tensor: torch.Tensor,
     scales: torch.Tensor,
@@ -405,6 +415,8 @@ def _dequantize_grouped_linear_4bit(
     lead_shape = scales.shape[:-1]
     rows = scales[..., 0].numel()
     group_count = int(scales.shape[-1])
+    scales_flat = scales.to(torch.float32).contiguous().view(rows, group_count)
+    zeros_flat = zeros.to(torch.float32).contiguous().view(rows, group_count)
     packed_u8 = packed.view(torch.uint8).contiguous().view(rows, group_count * (group_size // 2))
     packed_u8 = packed_u8.view(rows, group_count, group_size // 2)
 
@@ -412,7 +424,7 @@ def _dequantize_grouped_linear_4bit(
     q1 = (packed_u8 >> 4) & 0x0F
     q = torch.stack([q0, q1], dim=-1).reshape(rows, group_count, group_size)
 
-    x_hat = q.to(torch.float32) * scales.to(torch.float32).unsqueeze(-1) + zeros.to(torch.float32).unsqueeze(-1)
+    x_hat = q.to(torch.float32) * scales_flat.unsqueeze(-1) + zeros_flat.unsqueeze(-1)
     x_hat = x_hat.reshape(rows, group_count * group_size)[..., :out_dim]
     x_hat = x_hat.view(*lead_shape, out_dim)
     if out is not None:
@@ -557,7 +569,7 @@ class AsymTurboQuantKVQuantizer:
         assert self.k_algo is not None
 
         if _triton_prod4_enabled(self.bits, tensor.device):
-            packed, gamma, norm = _triton_quantize_prod4(
+            packed, gamma, norm = _fused_turboquant_and_cache_kernel(
                 tensor,
                 self.k_algo.mse.pi,
                 self.k_algo.mse.codebook,
@@ -577,6 +589,25 @@ class AsymTurboQuantKVQuantizer:
             self._ensure_algo(tensor.shape[-1], tensor.device)
         packed, scales, zeros = _quantize_grouped_linear_4bit(tensor, self.v_group_size)
         return packed, scales, zeros
+
+    def quantize_kv(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.head_dim is None:
+            self._ensure_algo(k.shape[-1], k.device)
+        assert self.k_algo is not None
+
+        if _triton_prod4_enabled(self.bits, k.device):
+            q_k, gamma, norm = _fused_turboquant_and_cache_kernel(
+                k,
+                self.k_algo.mse.pi,
+                self.k_algo.mse.codebook,
+                self.k_algo.s,
+            )
+            s_k = torch.cat([gamma, norm], dim=-1).to(k.dtype)
+        else:
+            q_k, s_k = self.quantize_k(k)
+
+        q_v, s_v, z_v = self.quantize_v(v)
+        return q_k, s_k, q_v, s_v, z_v
 
     def dequantize_k(self, q_tensor: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype, out: torch.Tensor | None = None) -> torch.Tensor:
         if self.k_algo is None:
@@ -802,7 +833,7 @@ class TurboQuantProdKVQuantizer(BaseKVQuantizer):
         self._ensure_algo(tensor.shape[-1], tensor.device)
 
         if self._use_triton_prod4(tensor.device):
-            packed, gamma, norm = _triton_quantize_prod4(
+            packed, gamma, norm = _fused_turboquant_and_cache_kernel(
                 tensor,
                 self.algo.mse.pi,
                 self.algo.mse.codebook,

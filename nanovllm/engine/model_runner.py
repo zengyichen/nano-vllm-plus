@@ -41,7 +41,6 @@ class ModelRunner:
         self.warmup_activation_bytes = 0
         self.warmup_peak_bytes = 0
         self.warmup_current_bytes = 0
-        self.model_weight_bytes = 0
         if self.quantizer is not None and self.quant_decode_backend == "auto":
             if hasattr(self.quantizer, "quantize_k") and hasattr(self.quantizer, "quantize_v"):
                 self.quant_decode_backend = "asym_turboquant"
@@ -56,45 +55,30 @@ class ModelRunner:
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         backend = "nccl" if device == "cuda" else "gloo"
+        dist.init_process_group(backend, "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        if device == "cuda":
+            torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        dist_initialized = False
-        try:
-            dist.init_process_group(backend, "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-            dist_initialized = True
-            if device == "cuda":
-                torch.cuda.set_device(rank)
-            torch.set_default_dtype(hf_config.torch_dtype)
-            torch.set_default_device(device)
-            self.model = Qwen3ForCausalLM(hf_config)
-            load_model(self.model, config.model)
-            self.model_weight_bytes = int(
-                sum(p.numel() * p.element_size() for p in self.model.parameters())
-                + sum(b.numel() * b.element_size() for b in self.model.buffers())
-            )
-            self.sampler = Sampler()
-            self.warmup_model()
-            self.allocate_kv_cache()
-            if not self.enforce_eager:
-                self.capture_cudagraph()
+        torch.set_default_dtype(hf_config.torch_dtype)
+        torch.set_default_device(device)
+        self.model = Qwen3ForCausalLM(hf_config)
+        load_model(self.model, config.model)
+        self.sampler = Sampler()
+        self.warmup_model()
+        self.allocate_kv_cache()
+        if not self.enforce_eager:
+            self.capture_cudagraph()
+        torch.set_default_device("cpu")
+        torch.set_default_dtype(default_dtype)
 
-            if self.world_size > 1:
-                if rank == 0:
-                    self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-                    dist.barrier()
-                else:
-                    dist.barrier()
-                    self.shm = SharedMemory(name="nanovllm")
-                    self.loop()
-        except Exception:
-            if dist_initialized and dist.is_available() and dist.is_initialized():
-                try:
-                    dist.destroy_process_group()
-                except Exception:
-                    pass
-            raise
-        finally:
-            torch.set_default_device("cpu")
-            torch.set_default_dtype(default_dtype)
+        if self.world_size > 1:
+            if rank == 0:
+                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                dist.barrier()
+            else:
+                dist.barrier()
+                self.shm = SharedMemory(name="nanovllm")
+                self.loop()
 
     def exit(self):
         if self.world_size > 1:
@@ -141,6 +125,14 @@ class ModelRunner:
         torch.cuda.empty_cache()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
+
+        # Adaptive warmup: when VRAM is tight (model >70% total), reduce warmup
+        # batch size to avoid OOM during the activation peak measurement pass.
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        used_bytes = total_bytes - free_bytes
+        if used_bytes > int(total_bytes * 0.70):
+            num_seqs = 1
+
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
 
         # First pass triggers one-off compile/autotune paths.
@@ -216,6 +208,22 @@ class ModelRunner:
             f"No VRAM available for KV Cache: available={available_bytes / 1024**2:.1f}MB, "
             f"block={block_bytes / 1024**2:.2f}MB"
         )
+
+        # When KV cache blocks are scarce, reduce max_num_seqs and max_num_batched_tokens
+        # so that max_model_len is not starved. Aim for at least 1024-token contexts.
+        min_desired_model_len = min(1024, int(config.max_model_len))
+        min_blocks_per_seq = math.ceil(min_desired_model_len / int(self.block_size))
+        max_seqs_by_blocks = max(1, int(config.num_kvcache_blocks) // min_blocks_per_seq)
+        if int(config.max_num_seqs) > max_seqs_by_blocks:
+            if self.rank == 0:
+                print(
+                    f"[Warning] Requested max_num_seqs={config.max_num_seqs} too large for "
+                    f"{config.num_kvcache_blocks} KV blocks. Reducing to {max_seqs_by_blocks}."
+                )
+            config.max_num_seqs = max_seqs_by_blocks
+            mint = int(config.max_num_seqs) * int(config.max_model_len)
+            if int(config.max_num_batched_tokens) > mint:
+                config.max_num_batched_tokens = mint
 
         # Keep runtime scheduling self-consistent: requested max_model_len must fit KV blocks.
         effective_num_seqs = max(
@@ -333,8 +341,7 @@ class ModelRunner:
                 layer_id += 1
 
         if self.rank == 0:
-            print(f"[VRAM] Model Weights (Static): {self.model_weight_bytes / 1024**3:.2f} GB")
-            print(f"[VRAM] Runtime Allocated (Pre-KV): {model_allocated / 1024**3:.2f} GB")
+            print(f"[VRAM] Model Weights: {model_allocated / 1024**3:.2f} GB")
             print(f"[VRAM] Activations (Warmup Peak): {self.warmup_activation_bytes / 1024**3:.2f} GB")
             print(f"[VRAM] Safety Margin: {safety_margin_bytes / 1024**3:.2f} GB")
             if activation_reserve_bytes > 0:

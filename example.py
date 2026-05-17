@@ -11,14 +11,14 @@ def main():
         path,
         enforce_eager=True,
         tensor_parallel_size=1,
-        kv_quant_algo="turboquant",
+        # kv_quant_algo="turboquant",
         kv_quant_bits=4,
-        max_model_len=128,
-        max_num_batched_tokens=128,
+        max_model_len=4096,
+        max_num_batched_tokens=4096,
         max_num_seqs=1,
     )
 
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=64)
+    sampling_params = SamplingParams(temperature=0.6, max_tokens=128)
     user_prompt = "Give me a short introduction to large language models."
 
     fallback_chat_template = '''{%- for message in messages %}
