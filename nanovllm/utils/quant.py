@@ -471,10 +471,8 @@ class TurboQuantMSE(nn.Module):
         self.register_buffer("codebook", centroids.sort()[0])
 
     def quantize(self, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if fused_compress_mse is not None and _TRITON_AVAILABLE and v.is_cuda:
-            packed, norms = fused_compress_mse(v, self.pi, self.codebook)
-            return MSEQuantized(indices=packed, norms=norms, bits=self.bits)
-
+        # NOTE: fused_compress_mse returns packed uint8 (byte-pair), but dequantize
+        # and callers expect unpacked int64 codebook indices. Skip fused path for now.
         v32 = v.to(torch.float32)
         norm = torch.linalg.norm(v32, dim=-1, keepdim=True).clamp_min(1e-8)
         x = v32 / norm

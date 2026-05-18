@@ -31,24 +31,22 @@ def _fused_compress_mse_kernel(
     inv_norm = 1.0 / tl.maximum(norm, 1e-10)
     x = x * inv_norm
 
-    y0 = tl.zeros([], dtype=tl.float32)
+    k_offs = tl.arange(0, D)
+    pi0_vals = tl.load(PI_ptr + d0 + k_offs * D, mask=k_offs < D, other=0.0)
+    y0 = tl.sum(x * pi0_vals, axis=0)
     y1 = tl.zeros([], dtype=tl.float32)
-    for k in range(D):
-        xk = x[k]
-        pi0 = tl.load(PI_ptr + k * D + d0)
-        y0 += xk * pi0
-        if d1 < D:
-            pi1 = tl.load(PI_ptr + k * D + d1)
-            y1 += xk * pi1
+    if d1 < D:
+        pi1_vals = tl.load(PI_ptr + d1 + k_offs * D, mask=k_offs < D, other=0.0)
+        y1 = tl.sum(x * pi1_vals, axis=0)
 
-    c0 = tl.load(CENTROIDS_PTR + 0)
-    c1 = tl.load(CENTROIDS_PTR + 1)
-    c2 = tl.load(CENTROIDS_PTR + 2)
-    c3 = tl.load(CENTROIDS_PTR + 3)
-    c4 = tl.load(CENTROIDS_PTR + 4)
-    c5 = tl.load(CENTROIDS_PTR + 5)
-    c6 = tl.load(CENTROIDS_PTR + 6)
-    c7 = tl.load(CENTROIDS_PTR + 7)
+    c0 = tl.load(CENTROIDS_ptr + 0)
+    c1 = tl.load(CENTROIDS_ptr + 1)
+    c2 = tl.load(CENTROIDS_ptr + 2)
+    c3 = tl.load(CENTROIDS_ptr + 3)
+    c4 = tl.load(CENTROIDS_ptr + 4)
+    c5 = tl.load(CENTROIDS_ptr + 5)
+    c6 = tl.load(CENTROIDS_ptr + 6)
+    c7 = tl.load(CENTROIDS_ptr + 7)
 
     best_dist0 = tl.abs(y0 - c0)
     best_idx0 = tl.zeros([], dtype=tl.int32)
