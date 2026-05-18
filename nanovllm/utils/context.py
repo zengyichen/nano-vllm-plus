@@ -18,6 +18,7 @@ class Context:
     quant_q_rot: torch.Tensor | None = None
     quant_q_sketch: torch.Tensor | None = None
     quant_v_group_size: int = 0
+    return_all_logits: bool = False
 
 _CONTEXT = Context()
 

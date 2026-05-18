@@ -1,0 +1,29 @@
+{
+  "mode": "all",
+  "model": "/home/vit2004/huggingface/Qwen3-8B-AWQ/",
+  "data_file": "benchmarks/data/wikitext-2-test.txt",
+  "prefix_len": 256,
+  "max_eval_tokens": 512,
+  "results": {
+    "noquant": {
+      "success": true,
+      "perplexity": 9.986518262345452,
+      "mean_nll": 2.301236009624712,
+      "evaluated_tokens": 512
+    },
+    "kvquant": {
+      "success": true,
+      "perplexity": 11.920658691682048,
+      "mean_nll": 2.4782729194797604,
+      "evaluated_tokens": 512,
+      "ppl_delta_pct_vs_noquant": 19.37
+    },
+    "asym": {
+      "success": true,
+      "perplexity": 10.438097343641944,
+      "mean_nll": 2.345462319067939,
+      "evaluated_tokens": 512,
+      "ppl_delta_pct_vs_noquant": 4.52
+    }
+  }
+}

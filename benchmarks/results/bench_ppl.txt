@@ -1,0 +1,48 @@
+
+[RUNNING] PPL/noquant
+[PPL/noquant] --- NoQuant perplexity benchmark ---
+[PPL/noquant] [INFO] sample_words=200, sample_tokens=237, chunk_tokens=128
+[PPL/noquant] [VRAM] Model Weights: 1.14 GB
+[PPL/noquant] [VRAM] Activations (Warmup Peak): 0.01 GB
+[PPL/noquant] [VRAM] Safety Margin: 0.25 GB
+[PPL/noquant] [VRAM] Activation Reserve: 0.01 GB
+[PPL/noquant] [VRAM] KV Cache: 5.30 GB
+[PPL/noquant] [INFO] evaluated 128/236 next-token targets
+[PPL/noquant] [INFO] evaluated 236/236 next-token targets
+[PPL/noquant] `torch_dtype` is deprecated! Use `dtype` instead!
+
+[RUNNING] PPL/kvquant
+[PPL/kvquant] --- KVQuant_4bit perplexity benchmark ---
+[PPL/kvquant] [INFO] sample_words=200, sample_tokens=237, chunk_tokens=128
+[PPL/kvquant] [VRAM] Model Weights: 1.14 GB
+[PPL/kvquant] [VRAM] Activations (Warmup Peak): 0.01 GB
+[PPL/kvquant] [VRAM] Safety Margin: 0.25 GB
+[PPL/kvquant] [VRAM] Activation Reserve: 0.01 GB
+[PPL/kvquant] [VRAM] Decode Workspace Reserve: 0.00 GB
+[PPL/kvquant] [VRAM] KV Cache: 5.30 GB
+[PPL/kvquant] [VRAM] KV Decode Workspace: 0.00 GB (238 tokens)
+[PPL/kvquant] [INFO] evaluated 128/236 next-token targets
+[PPL/kvquant] [INFO] evaluated 236/236 next-token targets
+[PPL/kvquant] `torch_dtype` is deprecated! Use `dtype` instead!
+
+[RUNNING] PPL/asym
+[PPL/asym] --- AsymTurboQuant_4bit perplexity benchmark ---
+[PPL/asym] [INFO] sample_words=200, sample_tokens=237, chunk_tokens=128
+[PPL/asym] [VRAM] Model Weights: 1.14 GB
+[PPL/asym] [VRAM] Activations (Warmup Peak): 0.01 GB
+[PPL/asym] [VRAM] Safety Margin: 0.25 GB
+[PPL/asym] [VRAM] Activation Reserve: 0.01 GB
+[PPL/asym] [VRAM] Decode Workspace Reserve: 0.00 GB
+[PPL/asym] [VRAM] K Cache: 2.44 GB
+[PPL/asym] [VRAM] V Cache: 2.87 GB
+[PPL/asym] [VRAM] KV Decode Workspace: 0.00 GB (238 tokens)
+[PPL/asym] [INFO] evaluated 128/236 next-token targets
+[PPL/asym] [INFO] evaluated 236/236 next-token targets
+[PPL/asym] `torch_dtype` is deprecated! Use `dtype` instead!
+
+=== Perplexity Summary ===
+mode      success  perplexity  mean_nll  eval_tokens  ppl_ratio_vs_noquant  ppl_delta_pct
+noquant   True    41.866694   3.734491  236         1.000000              +0.00
+kvquant   True    41.866694   3.734491  236         1.000000              +0.00
+asym      True    41.866694   3.734491  236         1.000000              +0.00
+{"mode": "all", "model": "/home/vit2004/huggingface/Qwen3-0.6B/", "sample_words": 200, "chunk_tokens": 128, "results": {"noquant": {"mode": "noquant", "name": "NoQuant", "sample_words": 200, "chunk_tokens": 128, "success": true, "error": null, "sample_tokens": 237, "evaluated_tokens": 236, "mean_nll": 3.7344906118392456, "perplexity": 41.86669373235577, "ppl_ratio_vs_noquant": 1.0, "ppl_delta_pct_vs_noquant": 0.0}, "kvquant": {"mode": "kvquant", "name": "KVQuant_4bit", "sample_words": 200, "chunk_tokens": 128, "success": true, "error": null, "sample_tokens": 237, "evaluated_tokens": 236, "mean_nll": 3.7344906118392456, "perplexity": 41.86669373235577, "ppl_ratio_vs_noquant": 1.0, "ppl_delta_pct_vs_noquant": 0.0}, "asym": {"mode": "asym", "name": "AsymTurboQuant_4bit", "sample_words": 200, "chunk_tokens": 128, "success": true, "error": null, "sample_tokens": 237, "evaluated_tokens": 236, "mean_nll": 3.7344906118392456, "perplexity": 41.86669373235577, "ppl_ratio_vs_noquant": 1.0, "ppl_delta_pct_vs_noquant": 0.0}}}

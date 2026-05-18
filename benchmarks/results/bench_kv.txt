@@ -1,0 +1,39 @@
+
+[RUNNING] KV/noquant
+[KV/noquant] --- NoQuant KV benchmark: context_len=1024 ---
+[KV/noquant] [VRAM] Model Weights: 1.14 GB
+[KV/noquant] [VRAM] Activations (Warmup Peak): 0.03 GB
+[KV/noquant] [VRAM] Safety Margin: 0.25 GB
+[KV/noquant] [VRAM] Activation Reserve: 0.03 GB
+[KV/noquant] [VRAM] KV Cache: 5.28 GB
+[KV/noquant] `torch_dtype` is deprecated! Use `dtype` instead!
+
+[RUNNING] KV/kvquant
+[KV/kvquant] --- KVQuant_4bit KV benchmark: context_len=1024 ---
+[KV/kvquant] [VRAM] Model Weights: 1.14 GB
+[KV/kvquant] [VRAM] Activations (Warmup Peak): 0.03 GB
+[KV/kvquant] [VRAM] Safety Margin: 0.25 GB
+[KV/kvquant] [VRAM] Activation Reserve: 0.03 GB
+[KV/kvquant] [VRAM] Decode Workspace Reserve: 0.00 GB
+[KV/kvquant] [VRAM] KV Cache: 5.28 GB
+[KV/kvquant] [VRAM] KV Decode Workspace: 0.00 GB (1024 tokens)
+[KV/kvquant] `torch_dtype` is deprecated! Use `dtype` instead!
+
+[RUNNING] KV/asym
+[KV/asym] --- AsymTurboQuant_4bit KV benchmark: context_len=1024 ---
+[KV/asym] [VRAM] Model Weights: 1.14 GB
+[KV/asym] [VRAM] Activations (Warmup Peak): 0.03 GB
+[KV/asym] [VRAM] Safety Margin: 0.25 GB
+[KV/asym] [VRAM] Activation Reserve: 0.03 GB
+[KV/asym] [VRAM] Decode Workspace Reserve: 0.00 GB
+[KV/asym] [VRAM] K Cache: 2.43 GB
+[KV/asym] [VRAM] V Cache: 2.85 GB
+[KV/asym] [VRAM] KV Decode Workspace: 0.00 GB (1024 tokens)
+[KV/asym] `torch_dtype` is deprecated! Use `dtype` instead!
+
+=== KV Compression Summary ===
+mode         success  peak_used_GB  bytes/token  compression_vs_noquant  saving_vs_noquant(%)
+noquant      True    0.1094        114576.11    1.0000                  0.00                 
+kvquant      True    0.0291        30434.28     3.7647                  73.44                
+asym         True    0.0316        33119.66     3.4595                  71.09                
+{"mode": "all", "model": "/home/vit2004/huggingface/Qwen3-0.6B/", "context_len": 1024, "results": {"noquant": {"mode": "noquant", "name": "NoQuant", "context_len": 1024, "success": true, "error": null, "effective_max_num_batched_tokens": 1024, "kv_cache_total_bytes": 5666504704, "kv_cache_total_gb": 5.27734375, "kv_cache_component_bytes": {"kv_cache": 5666504704}, "kv_total_blocks": 193, "kv_peak_used_blocks": 4, "kv_block_size": 256, "kv_bytes_per_block": 29360128.0, "kv_peak_used_bytes": 117440512.0, "kv_peak_used_gb": 0.109375, "measured_tokens": 1025, "kv_peak_used_bytes_per_token": 114576.10926829268, "compression_rate_vs_noquant": 1.0, "size_ratio_vs_noquant": 1.0, "saving_pct_vs_noquant": 0.0}, "kvquant": {"mode": "kvquant", "name": "KVQuant_4bit", "context_len": 1024, "success": true, "error": null, "effective_max_num_batched_tokens": 1024, "kv_cache_total_bytes": 5669715968, "kv_cache_total_gb": 5.28033447265625, "kv_cache_component_bytes": {"kv_cache": 5336203264, "kv_scales": 333512704}, "kv_total_blocks": 727, "kv_peak_used_blocks": 4, "kv_block_size": 256, "kv_bytes_per_block": 7798784.0, "kv_peak_used_bytes": 31195136.0, "kv_peak_used_gb": 0.029052734375, "measured_tokens": 1025, "kv_peak_used_bytes_per_token": 30434.279024390245, "compression_rate_vs_noquant": 3.764705882352941, "size_ratio_vs_noquant": 0.265625, "saving_pct_vs_noquant": 73.4375}, "asym": {"mode": "asym", "name": "AsymTurboQuant_4bit", "context_len": 1024, "success": true, "error": null, "effective_max_num_batched_tokens": 1024, "kv_cache_total_bytes": 5669257216, "kv_cache_total_gb": 5.2799072265625, "kv_cache_component_bytes": {"kv_k_cache": 2451570688, "kv_k_scales": 153223168, "kv_v_cache": 2451570688, "kv_v_scales": 306446336, "kv_v_zeros": 306446336}, "kv_total_blocks": 668, "kv_peak_used_blocks": 4, "kv_block_size": 256, "kv_bytes_per_block": 8486912.0, "kv_peak_used_bytes": 33947648.0, "kv_peak_used_gb": 0.0316162109375, "measured_tokens": 1025, "kv_peak_used_bytes_per_token": 33119.656585365854, "compression_rate_vs_noquant": 3.4594594594594597, "size_ratio_vs_noquant": 0.2890625, "saving_pct_vs_noquant": 71.09375}}}
