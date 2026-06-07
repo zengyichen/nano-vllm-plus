@@ -13,6 +13,43 @@ uv pip install -e . --no-build-isolation
 
 依赖：torch>=2.4.0, triton>=3.0.0, transformers>=4.51.0, flash-attn, xxhash。
 
+## 项目结构
+
+```
+nano-vllm/
+├── nanovllm/                 # 核心库代码
+│   ├── engine/               # 推理引擎 (scheduler, block_manager, model_runner)
+│   ├── layers/               # 模型层 (attention, awq_linear, fused_quant_attn, linear, ...)
+│   ├── models/               # 模型定义 (qwen3.py)
+│   ├── utils/                # 工具 (quant, context, loader)
+│   ├── config.py             # 全局配置数据类
+│   ├── llm.py                # 用户入口 (LLM 类)
+│   └── sampling_params.py    # 采样参数
+├── benchmarks/               # 基准测试脚本和结果
+│   ├── bench_mse.py          # 量化 MSE/IP 偏差测量（独立实现，不依赖 nanovllm）
+│   ├── bench_ppl.py          # PPL 评估（WikiText-2，decode-path）
+│   ├── bench_ablation.py     # K/V 组合消融实验
+│   ├── bench_kv.py           # KV cache 吞吐测试
+│   ├── bench_memory.py       # 显存占用测试
+│   ├── bench_quant.py        # 量化性能测试
+│   ├── data/                 # 测试数据集
+│   └── results/              # 基准测试结果 (JSON + TXT)
+├── docs/                     # 设计文档与演示材料
+│   ├── draft.md              # 工作草稿
+│   ├── ppt_outline.md        # PPT 提纲
+│   └── ppt_script.md         # 汇报讲稿
+├── install.sh                # 一键安装脚本
+├── pyproject.toml            # 项目配置
+├── CLAUDE.md                 # 本文件
+└── README.md
+```
+
+- **`docs/`**：设计文档和演示材料，非代码产物
+- **`benchmarks/results/`**：所有 benchmark 结果的统一存放位置。脚本默认输出到此目录
+- **`benchmarks/bench_mse.py`**：独立于 nanovllm 库的纯 PyTorch 实现，直接复现论文算法，用于理论验证
+- **`benchmarks/bench_ppl.py`**：依赖 nanovllm 库，测试真实模型的 PPL
+- 论文 PDF 和生成的 slides HTML 已加入 `.gitignore`，不纳入版本管理
+
 ## 架构
 
 Nano-vLLM 是一个轻量级 vLLM 重实现（约 1,200 行 Python），API 与 vLLM 基本一致。
@@ -51,12 +88,12 @@ Nano-vLLM 是一个轻量级 vLLM 重实现（约 1,200 行 Python），API 与 
 
 - **context.py**：全局可变 `Context` 数据类，通过 `get_context()` / `set_context()` 访问。携带 slot mapping、block table、序列长度和量化元数据贯穿整个前向传播，避免逐层传参。每次 step 后必须调用 `reset_context()`。
 - **loader.py**：遍历 `.safetensors` 文件，解析 packed module mapping，分发到各个参数的 `weight_loader` 可调用对象。
-- **quant.py**：KV cache 量化子系统。三个量化器类实现 `BaseKVQuantizer` 接口：
-  - `TurboQuantMSEKVQuantizer`（3-bit）：基于 MSE 的向量量化，含学习的旋转矩阵和码本
-  - `TurboQuantProdKVQuantizer`（3-4 bit）：在 MSE 基础上扩展内积残差（QJL）
-  - `AsymTurboQuantKVQuantizer`（4-bit K + 4-bit 分组线性 V）：分离式 K/V 缓存布局。K 使用 TurboQuantProd；V 使用逐组仿射量化（scales + zeros）
-
-  通过 `get_kv_quantizer(config)` 根据 `kv_quant_algo` 选择量化器。
+- **quant.py**：KV cache 量化子系统。统一使用 `AsymTurboQuantKVQuantizer`，通过 `k_method` / `v_method` 独立选择 K 和 V 的量化算法：
+  - `turboquant_mse`：随机旋转 + Lloyd-Max 码本量化（Theorem 1 保界）
+  - `turboquant_prod`：MSE + QJL 内积残差修正（Theorem 2 无偏，Lemma 4 π/2 惩罚）
+  - `grouped_linear`：逐组 min-max 仿射量化（scales + zeros，group_size 可配）
+  - K 和 V 的算法可任意组合，通过 `config.k_quant_algo` / `config.v_quant_algo` 独立指定
+  - 通过 `get_kv_quantizer(config)` 创建量化器，向后兼容 `kv_quant_algo` 参数
 
 ### Decode 后端路由
 

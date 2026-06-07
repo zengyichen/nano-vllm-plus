@@ -199,3 +199,6 @@ cython_debug/
 
 # Papers
 2504.19874v1.pdf
+
+# Generated slides
+slides.html

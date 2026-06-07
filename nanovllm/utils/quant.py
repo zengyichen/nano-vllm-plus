@@ -522,164 +522,304 @@ class TurboQuantProd(nn.Module):
 
 
 class AsymTurboQuantKVQuantizer:
-    def __init__(self, head_dim: int | None = None, k_bits: int = 4, v_bits: int = 4, v_group_size: int = 32, seed: int = 0):
+    """Generalized asymmetric KV quantizer supporting independent K and V methods.
+
+    k_method / v_method:
+      - "turboquant_prod": TurboQuantProd (4-bit MSE+QJL, unbiased inner products)
+      - "turboquant_mse":  TurboQuantMSE (3/4-bit MSE-only codebook)
+      - "grouped_linear":  Per-group min-max affine (4-bit, lowest MSE)
+
+    Supports all 4 K/V combinations. Fused attention kernel only for
+    K=turboquant_prod + V=grouped_linear; other combos use dequant_flash fallback.
+    """
+
+    def __init__(self, head_dim: int | None = None, k_bits: int = 4, v_bits: int = 4,
+                 k_method: str = "turboquant_prod", v_method: str = "grouped_linear",
+                 v_group_size: int = 32, seed: int = 0):
         self.bits = int(k_bits)
         self.scale_dim = 1
         self.head_dim = int(head_dim) if head_dim is not None else None
         self.v_bits = int(v_bits)
+        self.k_method = k_method
+        self.v_method = v_method
         self.v_group_size = int(v_group_size)
         self.seed = int(seed)
-        self.k_algo: TurboQuantProd | None = None
-        self.v_scale_dim = 2
-        if self.bits != 4:
-            raise ValueError("AsymTurboQuantKVQuantizer currently implements 4-bit K only")
-        if self.v_bits != 4:
-            raise ValueError("AsymTurboQuantKVQuantizer currently implements 4-bit grouped-linear V only")
-        if self.v_group_size <= 0 or self.v_group_size % 2 != 0:
-            raise ValueError(f"v_group_size must be positive and even, got {self.v_group_size}")
+        self.k_algo: TurboQuantProd | TurboQuantMSE | None = None
+        self.v_algo: TurboQuantProd | TurboQuantMSE | None = None
         if head_dim is not None:
             self._ensure_algo(int(head_dim), torch.device("cpu"))
 
     def _ensure_algo(self, head_dim: int, device: torch.device):
-        if self.k_algo is None or self.k_algo.d != head_dim:
-            self.k_algo = TurboQuantProd(head_dim, bits=self.bits, seed=self.seed)
-        self.k_algo = self.k_algo.to(device)
-        self.head_dim = int(head_dim)
+        d = int(head_dim)
+        if self.k_method == "turboquant_prod":
+            if self.k_algo is None or self.k_algo.d != d:
+                self.k_algo = TurboQuantProd(d, bits=self.bits, seed=self.seed)
+            self.k_algo = self.k_algo.to(device)
+        elif self.k_method == "turboquant_mse":
+            if self.k_algo is None or self.k_algo.d != d:
+                self.k_algo = TurboQuantMSE(d, bits=self.bits, seed=self.seed)
+            self.k_algo = self.k_algo.to(device)
+        elif self.k_method == "grouped_linear":
+            self.k_algo = None  # no algo object needed; uses _quantize_grouped_linear_4bit directly
+        else:
+            raise ValueError(f"Unknown k_method: {self.k_method}")
+        self.head_dim = d
+
+    def _ensure_v_algo(self, head_dim: int, device: torch.device):
+        d = int(head_dim)
+        if self.v_method == "turboquant_prod":
+            if self.v_algo is None or self.v_algo.d != d:
+                self.v_algo = TurboQuantProd(d, bits=self.bits, seed=self.seed)
+            self.v_algo = self.v_algo.to(device)
+        elif self.v_method == "turboquant_mse":
+            if self.v_algo is None or self.v_algo.d != d:
+                self.v_algo = TurboQuantMSE(d, bits=self.bits, seed=self.seed)
+            self.v_algo = self.v_algo.to(device)
+
+    # ── Cache allocation ──────────────────────────────────────────────────────
 
     def allocate_cache(self, num_layers, num_blocks, block_size, num_kv_heads, head_dim, dtype, device):
         raise RuntimeError("use allocate_cache_split for AsymTurboQuantKVQuantizer")
 
     def allocate_cache_split(self, num_layers, num_blocks, block_size, num_kv_heads, head_dim, dtype, device):
         self._ensure_algo(int(head_dim), torch.device(device))
-        k_cache_dim = (int(head_dim) + 1) // 2 if self.bits == 4 and _TRITON_AVAILABLE else int(head_dim)
-        v_cache_dim = (int(head_dim) + 1) // 2
-        group_count = math.ceil(int(head_dim) / self.v_group_size)
+        d = int(head_dim)
 
-        k_cache = torch.empty(int(num_layers), int(num_blocks), int(block_size), int(num_kv_heads), k_cache_dim, dtype=torch.int8, device=device)
-        k_scales = torch.empty(int(num_layers), int(num_blocks), int(block_size), int(num_kv_heads), 2, dtype=dtype, device=device)
-        v_cache = torch.empty(int(num_layers), int(num_blocks), int(block_size), int(num_kv_heads), v_cache_dim, dtype=torch.int8, device=device)
-        v_scales = torch.empty(int(num_layers), int(num_blocks), int(block_size), int(num_kv_heads), group_count, dtype=dtype, device=device)
-        v_zeros = torch.empty_like(v_scales)
-        return k_cache, k_scales, v_cache, v_scales, v_zeros
+        # K cache dimensions depend on k_method
+        k_packed_dim = (d + 1) // 2  # 4-bit packed
+        k_scales_dim = _k_scales_dim(self.k_method, d, self.v_group_size)
 
-    def quantize_k(self, tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # V cache dimensions depend on v_method
+        v_packed_dim = (d + 1) // 2
+        v_scales_dim = _v_scales_dim(self.v_method, d, self.v_group_size)
+
+        k_cache = torch.empty(int(num_layers), int(num_blocks), int(block_size), int(num_kv_heads),
+                              k_packed_dim, dtype=torch.int8, device=device)
+        k_scales = torch.empty(int(num_layers), int(num_blocks), int(block_size), int(num_kv_heads),
+                               k_scales_dim, dtype=dtype, device=device)
+        k_zeros = torch.empty_like(k_scales) if self.k_method == "grouped_linear" else None
+
+        v_cache = torch.empty(int(num_layers), int(num_blocks), int(block_size), int(num_kv_heads),
+                              v_packed_dim, dtype=torch.int8, device=device)
+        v_scales = torch.empty(int(num_layers), int(num_blocks), int(block_size), int(num_kv_heads),
+                               v_scales_dim, dtype=dtype, device=device)
+        v_zeros = torch.empty_like(v_scales) if self.v_method == "grouped_linear" else None
+
+        return k_cache, k_scales, k_zeros, v_cache, v_scales, v_zeros
+
+    # ── Quantize ──────────────────────────────────────────────────────────────
+
+    def quantize_k(self, tensor: torch.Tensor) -> tuple:
         self._ensure_algo(tensor.shape[-1], tensor.device)
-        assert self.k_algo is not None
 
-        if _triton_prod4_enabled(self.bits, tensor.device):
-            packed, gamma, norm = _fused_turboquant_and_cache_kernel(
-                tensor,
-                self.k_algo.mse.pi,
-                self.k_algo.mse.codebook,
-                self.k_algo.s,
-            )
+        if self.k_method == "turboquant_prod":
+            assert self.k_algo is not None
+            if _triton_prod4_enabled(self.bits, tensor.device):
+                packed, gamma, norm = _fused_turboquant_and_cache_kernel(
+                    tensor, self.k_algo.mse.pi, self.k_algo.mse.codebook, self.k_algo.s)
+                scales = torch.cat([gamma, norm], dim=-1).to(tensor.dtype)
+                return packed, scales
+            idx, qjl, gamma, norm = self.k_algo.quantize(tensor)
+            qjl_bit = (qjl > 0).to(torch.uint8)
+            packed = ((idx.to(torch.uint8) << 1) | qjl_bit).view(torch.int8)
             scales = torch.cat([gamma, norm], dim=-1).to(tensor.dtype)
             return packed, scales
 
-        idx, qjl, gamma, norm = self.k_algo.quantize(tensor)
-        qjl_bit = (qjl > 0).to(torch.uint8)
-        packed = ((idx.to(torch.uint8) << 1) | qjl_bit).view(torch.int8)
-        scales = torch.cat([gamma, norm], dim=-1).to(tensor.dtype)
-        return packed, scales
+        elif self.k_method == "turboquant_mse":
+            assert self.k_algo is not None
+            idx, norm = self.k_algo.quantize(tensor)
+            return idx.to(torch.int8), norm.to(tensor.dtype)
 
-    def quantize_v(self, tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        elif self.k_method == "grouped_linear":
+            packed, scales, zeros = _quantize_grouped_linear_4bit(tensor, self.v_group_size)
+            return packed, scales, zeros
+
+        raise ValueError(f"Unknown k_method: {self.k_method}")
+
+    def quantize_v(self, tensor: torch.Tensor) -> tuple:
         if self.head_dim is None:
             self._ensure_algo(tensor.shape[-1], tensor.device)
-        packed, scales, zeros = _quantize_grouped_linear_4bit(tensor, self.v_group_size)
-        return packed, scales, zeros
 
-    def quantize_kv(self, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.v_method == "grouped_linear":
+            packed, scales, zeros = _quantize_grouped_linear_4bit(tensor, self.v_group_size)
+            return packed, scales, zeros
+
+        elif self.v_method == "turboquant_prod":
+            self._ensure_v_algo(tensor.shape[-1], tensor.device)
+            if _triton_prod4_enabled(self.bits, tensor.device):
+                packed, gamma, norm = _fused_turboquant_and_cache_kernel(
+                    tensor, self.v_algo.mse.pi, self.v_algo.mse.codebook, self.v_algo.s)
+                scales = torch.cat([gamma, norm], dim=-1).to(tensor.dtype)
+                return packed, scales
+            idx, qjl, gamma, norm = self.v_algo.quantize(tensor)
+            qjl_bit = (qjl > 0).to(torch.uint8)
+            packed = ((idx.to(torch.uint8) << 1) | qjl_bit).view(torch.int8)
+            scales = torch.cat([gamma, norm], dim=-1).to(tensor.dtype)
+            return packed, scales
+
+        elif self.v_method == "turboquant_mse":
+            self._ensure_v_algo(tensor.shape[-1], tensor.device)
+            idx, norm = self.v_algo.quantize(tensor)
+            return idx.to(torch.int8), norm.to(tensor.dtype)
+
+        raise ValueError(f"Unknown v_method: {self.v_method}")
+
+    def quantize_kv(self, k: torch.Tensor, v: torch.Tensor) -> tuple:
         if self.head_dim is None:
             self._ensure_algo(k.shape[-1], k.device)
-        assert self.k_algo is not None
+        k_result = self.quantize_k(k)
+        v_result = self.quantize_v(v)
+        q_k, scale_k = k_result[:2]
+        k_zero = k_result[2] if len(k_result) > 2 else None
+        q_v, scale_v = v_result[:2]
+        v_zero = v_result[2] if len(v_result) > 2 else None
+        return q_k, scale_k, k_zero, q_v, scale_v, v_zero
 
-        if _triton_prod4_enabled(self.bits, k.device):
-            q_k, gamma, norm = _fused_turboquant_and_cache_kernel(
-                k,
-                self.k_algo.mse.pi,
-                self.k_algo.mse.codebook,
-                self.k_algo.s,
-            )
-            s_k = torch.cat([gamma, norm], dim=-1).to(k.dtype)
-        else:
-            q_k, s_k = self.quantize_k(k)
+    # ── Dequantize ────────────────────────────────────────────────────────────
 
-        q_v, s_v, z_v = self.quantize_v(v)
-        return q_k, s_k, q_v, s_v, z_v
+    def dequantize_k(self, q_tensor: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype,
+                     out: torch.Tensor | None = None, zeros: torch.Tensor | None = None) -> torch.Tensor:
+        if self.k_method == "turboquant_prod":
+            if self.k_algo is None:
+                self._ensure_algo(self.head_dim or q_tensor.shape[-1], q_tensor.device)
+            assert self.k_algo is not None
+            if _triton_prod4_enabled(self.bits, q_tensor.device):
+                return _triton_dequantize_prod4(
+                    q_tensor, scales, self.k_algo.mse.pi, self.k_algo.mse.codebook,
+                    self.k_algo.s, self.k_algo.d, dtype, out=out)
+            # Non-Triton fallback
+            packed_u8 = q_tensor.view(torch.uint8).to(torch.int64)
+            idx = packed_u8 >> 1
+            qjl_bit = packed_u8 & 1
+            qjl = torch.where(qjl_bit > 0, torch.ones_like(q_tensor, dtype=dtype),
+                              -torch.ones_like(q_tensor, dtype=dtype))
+            gamma = scales[..., 0:1]
+            norm = scales[..., 1:2]
+            out_tensor = self.k_algo.dequantize(idx, qjl, gamma, norm).to(dtype)
+            if out is not None:
+                out.copy_(out_tensor.to(out.dtype))
+                return out
+            return out_tensor
 
-    def dequantize_k(self, q_tensor: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype, out: torch.Tensor | None = None) -> torch.Tensor:
-        if self.k_algo is None:
-            self._ensure_algo(self.head_dim or q_tensor.shape[-1], q_tensor.device)
-        assert self.k_algo is not None
+        elif self.k_method == "turboquant_mse":
+            if self.k_algo is None:
+                self._ensure_algo(self.head_dim or q_tensor.shape[-1], q_tensor.device)
+            assert self.k_algo is not None
+            idx = q_tensor.to(torch.int64)
+            return self.k_algo.dequantize(idx, scales).to(dtype)
 
-        if _triton_prod4_enabled(self.bits, q_tensor.device):
-            return _triton_dequantize_prod4(
-                q_tensor,
-                scales,
-                self.k_algo.mse.pi,
-                self.k_algo.mse.codebook,
-                self.k_algo.s,
-                self.k_algo.d,
-                dtype,
-                out=out,
-            )
+        elif self.k_method == "grouped_linear":
+            if zeros is None:
+                raise ValueError("zeros tensor is required for grouped_linear K dequantization")
+            head_dim = self.head_dim or int(scales.shape[-1]) * self.v_group_size
+            return _dequantize_grouped_linear_4bit(
+                q_tensor, scales, zeros, self.v_group_size, head_dim, dtype, out=out)
 
-        packed_u8 = q_tensor.view(torch.uint8).to(torch.int64)
-        idx = packed_u8 >> 1
-        qjl_bit = packed_u8 & 1
-        qjl = torch.where(qjl_bit > 0, torch.ones_like(q_tensor, dtype=dtype), -torch.ones_like(q_tensor, dtype=dtype))
-        gamma = scales[..., 0:1]
-        norm = scales[..., 1:2]
-        out_tensor = self.k_algo.dequantize(idx, qjl, gamma, norm).to(dtype)
-        if out is not None:
-            if tuple(out.shape) != tuple(out_tensor.shape):
-                raise ValueError(f"dequant out shape mismatch: expected {tuple(out_tensor.shape)}, got {tuple(out.shape)}")
-            out.copy_(out_tensor.to(out.dtype))
-            return out
-        return out_tensor
+        raise ValueError(f"Unknown k_method: {self.k_method}")
 
-    def dequantize_v(
-        self,
-        q_tensor: torch.Tensor,
-        scales: torch.Tensor,
-        zeros: torch.Tensor | None,
-        dtype: torch.dtype,
-        out: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if zeros is None:
-            raise ValueError("zeros tensor is required for asym grouped-linear V dequantization")
-        head_dim = self.head_dim or int(scales.shape[-1]) * self.v_group_size
-        return _dequantize_grouped_linear_4bit(q_tensor, scales, zeros, self.v_group_size, head_dim, dtype, out=out)
+    def dequantize_v(self, q_tensor: torch.Tensor, scales: torch.Tensor,
+                     zeros: torch.Tensor | None, dtype: torch.dtype,
+                     out: torch.Tensor | None = None) -> torch.Tensor:
+        if self.v_method == "grouped_linear":
+            if zeros is None:
+                raise ValueError("zeros tensor is required for grouped_linear V dequantization")
+            head_dim = self.head_dim or int(scales.shape[-1]) * self.v_group_size
+            return _dequantize_grouped_linear_4bit(
+                q_tensor, scales, zeros, self.v_group_size, head_dim, dtype, out=out)
+
+        elif self.v_method == "turboquant_prod":
+            if self.v_algo is None:
+                self._ensure_v_algo(self.head_dim or q_tensor.shape[-1], q_tensor.device)
+            if _triton_prod4_enabled(self.bits, q_tensor.device):
+                return _triton_dequantize_prod4(
+                    q_tensor, scales, self.v_algo.mse.pi, self.v_algo.mse.codebook,
+                    self.v_algo.s, self.v_algo.d, dtype, out=out)
+            packed_u8 = q_tensor.view(torch.uint8).to(torch.int64)
+            idx = packed_u8 >> 1
+            qjl_bit = packed_u8 & 1
+            qjl = torch.where(qjl_bit > 0, torch.ones_like(q_tensor, dtype=dtype),
+                              -torch.ones_like(q_tensor, dtype=dtype))
+            gamma = scales[..., 0:1]
+            norm = scales[..., 1:2]
+            out_tensor = self.v_algo.dequantize(idx, qjl, gamma, norm).to(dtype)
+            if out is not None:
+                out.copy_(out_tensor.to(out.dtype))
+                return out
+            return out_tensor
+
+        elif self.v_method == "turboquant_mse":
+            if self.v_algo is None:
+                self._ensure_v_algo(self.head_dim or q_tensor.shape[-1], q_tensor.device)
+            idx = q_tensor.to(torch.int64)
+            return self.v_algo.dequantize(idx, scales).to(dtype)
+
+        raise ValueError(f"Unknown v_method: {self.v_method}")
+
+    # ── Codebook / rotation utilities (only for turboquant_prod K) ────────────
 
     def rotate_query(self, q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.k_method != "turboquant_prod":
+            raise RuntimeError(f"rotate_query requires k_method=turboquant_prod, got {self.k_method}")
         if self.k_algo is None:
             self._ensure_algo(q.shape[-1], q.device)
-        assert self.k_algo is not None and self.k_algo.mse is not None
+        assert self.k_algo is not None
         qf = q.to(torch.float32).contiguous()
         pi = self.k_algo.mse.pi.to(q.device, dtype=qf.dtype)
         s = self.k_algo.s.to(q.device, dtype=qf.dtype)
         return (qf @ pi.t()).contiguous(), (qf @ s.t()).contiguous()
 
     def get_codebook(self, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        if self.k_method != "turboquant_prod":
+            raise RuntimeError(f"get_codebook requires k_method=turboquant_prod, got {self.k_method}")
         if self.k_algo is None:
             if self.head_dim is None:
-                raise ValueError("head_dim is not initialized for asym quantizer")
+                raise ValueError("head_dim is not initialized")
             self._ensure_algo(self.head_dim, device)
         assert self.k_algo is not None
         return self.k_algo.mse.codebook.to(device=device, dtype=dtype)
 
     def supports_fused_decode(self, device: torch.device) -> bool:
-        return device.type == "cuda" and _TRITON_AVAILABLE
+        return device.type == "cuda" and _TRITON_AVAILABLE and self.k_method == "turboquant_prod"
 
-    def dequantize(self, q_tensor: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype, out: torch.Tensor | None = None) -> torch.Tensor:
+    def dequantize(self, q_tensor: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype,
+                   out: torch.Tensor | None = None) -> torch.Tensor:
         return self.dequantize_k(q_tensor, scales, dtype, out=out)
 
+    # ── VRAM budget ───────────────────────────────────────────────────────────
+
     def bytes_per_token_head(self, head_dim: int, dtype_size: int) -> tuple[int, int]:
-        k_persistent = (int(head_dim) + 1) // 2 + dtype_size * 2 if self.bits == 4 and _TRITON_AVAILABLE else int(head_dim) + dtype_size * 2
-        group_count = math.ceil(int(head_dim) / self.v_group_size)
-        v_persistent = (int(head_dim) + 1) // 2 + dtype_size * group_count * 2
-        transient = 0
-        return k_persistent + v_persistent, transient
+        d = int(head_dim)
+        # K persistent bytes
+        if self.k_method == "turboquant_prod":
+            k_persistent = (d + 1) // 2 + dtype_size * 2  # packed + gamma + norm
+        elif self.k_method == "turboquant_mse":
+            k_persistent = d + dtype_size  # int8 indices + norm
+        else:  # grouped_linear
+            gc_k = math.ceil(d / self.v_group_size)
+            k_persistent = (d + 1) // 2 + dtype_size * gc_k * 2  # packed + scales + zeros
+
+        # V persistent bytes
+        if self.v_method == "turboquant_prod":
+            v_persistent = (d + 1) // 2 + dtype_size * 2
+        elif self.v_method == "turboquant_mse":
+            v_persistent = d + dtype_size
+        else:  # grouped_linear
+            gc_v = math.ceil(d / self.v_group_size)
+            v_persistent = (d + 1) // 2 + dtype_size * gc_v * 2
+
+        return k_persistent + v_persistent, 0
+
+
+def _k_scales_dim(k_method: str, head_dim: int, group_size: int) -> int:
+    if k_method == "grouped_linear":
+        return math.ceil(int(head_dim) / group_size)
+    return 2  # turboquant_prod: (gamma, norm); turboquant_mse: norm (but keep dim=2 for compat)
+
+
+def _v_scales_dim(v_method: str, head_dim: int, group_size: int) -> int:
+    if v_method == "grouped_linear":
+        return math.ceil(int(head_dim) / group_size)
+    return 2  # turboquant_prod: (gamma, norm); turboquant_mse: norm
 
 
 class BaseKVQuantizer(ABC):
@@ -895,13 +1035,14 @@ class TurboQuantProdKVQuantizer(BaseKVQuantizer):
         return persistent, transient
 
 
-def get_kv_quantizer(config) -> BaseKVQuantizer | None:
-    algo = (config.kv_quant_algo or "").lower()
-    bits = config.kv_quant_bits if config.kv_quant_bits is not None else 3
-    if algo in {"turboquant", "turboquant_prod", "turboquant-prod"}:
-        return TurboQuantProdKVQuantizer(bits)
-    if algo in {"asym_turboquant", "asym-turboquant", "asym"}:
-        return AsymTurboQuantKVQuantizer(k_bits=bits, v_bits=config.kv_v_bits, v_group_size=config.kv_v_group_size)
-    if algo in {"turboquant_mse", "turboquant-mse"}:
-        return TurboQuantMSEKVQuantizer(bits)
-    return None
+def get_kv_quantizer(config) -> AsymTurboQuantKVQuantizer | None:
+    k_algo = (config.k_quant_algo or "").lower()
+    if k_algo not in {"turboquant_prod", "turboquant_mse", "grouped_linear"}:
+        return None
+    return AsymTurboQuantKVQuantizer(
+        k_bits=config.kv_quant_bits,
+        v_bits=config.kv_v_bits,
+        k_method=config.k_quant_algo,
+        v_method=config.v_quant_algo,
+        v_group_size=config.kv_v_group_size,
+    )

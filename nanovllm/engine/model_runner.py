@@ -37,15 +37,17 @@ class ModelRunner:
         self.kv_k_scales = None
         self.kv_v_cache = None
         self.kv_v_scales = None
+        self.kv_k_zeros = None
         self.kv_v_zeros = None
         self.warmup_activation_bytes = 0
         self.warmup_peak_bytes = 0
         self.warmup_current_bytes = 0
         if self.quantizer is not None and self.quant_decode_backend == "auto":
-            if hasattr(self.quantizer, "quantize_k") and hasattr(self.quantizer, "quantize_v"):
+            k_m = getattr(self.quantizer, "k_method", "")
+            v_m = getattr(self.quantizer, "v_method", "")
+            if k_m == "turboquant_prod" and v_m == "grouped_linear":
                 self.quant_decode_backend = "asym_turboquant"
             else:
-                # Prioritize throughput recovery with dequant + flash attention path.
                 self.quant_decode_backend = "dequant_flash"
         if self.quantizer is not None and not self.enforce_eager:
             # Keep eager by default; quant graph replay is opt-in per backend.
@@ -259,6 +261,7 @@ class ModelRunner:
             (
                 self.kv_k_cache,
                 self.kv_k_scales,
+                self.kv_k_zeros,
                 self.kv_v_cache,
                 self.kv_v_scales,
                 self.kv_v_zeros,
@@ -333,7 +336,8 @@ class ModelRunner:
                     if self.split_kv_cache:
                         module.k_scales = self.kv_k_scales[layer_id]
                         module.v_scales = self.kv_v_scales[layer_id]
-                        module.v_zeros = self.kv_v_zeros[layer_id]
+                        module.k_zeros = self.kv_k_zeros[layer_id] if self.kv_k_zeros is not None else None
+                        module.v_zeros = self.kv_v_zeros[layer_id] if self.kv_v_zeros is not None else None
                     else:
                         module.k_scales = self.kv_scales[0, layer_id]
                         module.v_scales = self.kv_scales[1, layer_id]
@@ -352,9 +356,12 @@ class ModelRunner:
             if self.split_kv_cache:
                 kv_k_size = self.kv_k_cache.element_size() * self.kv_k_cache.nelement()
                 kv_k_size += self.kv_k_scales.element_size() * self.kv_k_scales.nelement()
+                if self.kv_k_zeros is not None:
+                    kv_k_size += self.kv_k_zeros.element_size() * self.kv_k_zeros.nelement()
                 kv_v_size = self.kv_v_cache.element_size() * self.kv_v_cache.nelement()
                 kv_v_size += self.kv_v_scales.element_size() * self.kv_v_scales.nelement()
-                kv_v_size += self.kv_v_zeros.element_size() * self.kv_v_zeros.nelement()
+                if self.kv_v_zeros is not None:
+                    kv_v_size += self.kv_v_zeros.element_size() * self.kv_v_zeros.nelement()
                 print(f"[VRAM] K Cache: {kv_k_size / 1024**3:.2f} GB")
                 print(f"[VRAM] V Cache: {kv_v_size / 1024**3:.2f} GB")
             else:

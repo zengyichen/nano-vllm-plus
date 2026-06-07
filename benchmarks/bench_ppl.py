@@ -28,9 +28,13 @@ from nanovllm.utils.context import reset_context, get_context
 
 MODE_NAME = {
     "noquant": "NoQuant",
-    "kvquant": "KVQuant_4bit",
-    "asym": "AsymTurboQuant_4bit",
+    "k_prod_v_prod": "K=Prod_V=Prod",
+    "k_prod_v_grouped": "K=Prod_V=Grouped",
+    "k_grouped_v_prod": "K=Grouped_V=Prod",
+    "k_grouped_v_grouped": "K=Grouped_V=Grouped",
 }
+
+ALL_MODES = ["noquant", "k_prod_v_prod", "k_prod_v_grouped", "k_grouped_v_prod", "k_grouped_v_grouped"]
 
 
 def load_wikitext(path: str) -> str:
@@ -222,13 +226,33 @@ def _mode_kwargs(mode: str, total_context: int) -> dict:
         "max_model_len": max(64, int(total_context) + 1),
         "max_num_batched_tokens": max(64, int(total_context) + 1),
     }
-    if mode == "kvquant":
-        kwargs.update(kv_quant_algo="turboquant", kv_quant_bits=4)
-    elif mode == "asym":
+    if mode == "k_prod_v_prod":
         kwargs.update(
-            kv_quant_algo="asym_turboquant",
+            k_quant_algo="turboquant_prod",
+            v_quant_algo="turboquant_prod",
             kv_quant_bits=4,
-            kv_decode_backend="asym_turboquant",
+        )
+    elif mode == "k_prod_v_grouped":
+        kwargs.update(
+            k_quant_algo="turboquant_prod",
+            v_quant_algo="grouped_linear",
+            kv_quant_bits=4,
+            kv_v_bits=4,
+            kv_v_group_size=32,
+        )
+    elif mode == "k_grouped_v_prod":
+        kwargs.update(
+            k_quant_algo="grouped_linear",
+            v_quant_algo="turboquant_prod",
+            kv_quant_bits=4,
+            kv_v_bits=4,
+            kv_v_group_size=32,
+        )
+    elif mode == "k_grouped_v_grouped":
+        kwargs.update(
+            k_quant_algo="grouped_linear",
+            v_quant_algo="grouped_linear",
+            kv_quant_bits=4,
             kv_v_bits=4,
             kv_v_group_size=32,
         )
@@ -318,8 +342,10 @@ def add_relative_metrics(results: dict[str, dict]):
 
 def print_summary(results: dict[str, dict]):
     print("\n=== Perplexity Summary ===")
-    print("mode      success  perplexity  mean_nll  eval_tokens  ppl_ratio_vs_noquant  ppl_delta_pct")
-    for mode in ["noquant", "kvquant", "asym"]:
+    header = f"{'mode':<22} {'success':<7} {'ppl':<11} {'mean_nll':<9} {'tokens':<7} {'ppl_ratio':<10} {'delta_pct':<9}"
+    print(header)
+    print("-" * len(header))
+    for mode in ALL_MODES:
         row = results.get(mode, {})
         success = str(bool(row.get("success", False)))
         ppl = row.get("perplexity")
@@ -328,20 +354,21 @@ def print_summary(results: dict[str, dict]):
         ratio = row.get("ppl_ratio_vs_noquant")
         delta = row.get("ppl_delta_pct_vs_noquant")
 
+        name = MODE_NAME.get(mode, mode)
         ppl_text = f"{ppl:.6f}" if isinstance(ppl, (int, float)) else "-"
         nll_text = f"{nll:.6f}" if isinstance(nll, (int, float)) else "-"
         et_text = f"{int(et)}" if isinstance(et, (int, float)) else "-"
         ratio_text = f"{ratio:.6f}" if isinstance(ratio, (int, float)) else "-"
-        delta_text = f"{delta:+.2f}" if isinstance(delta, (int, float)) else "-"
+        delta_text = f"{delta:+.2f}%" if isinstance(delta, (int, float)) else "-"
 
-        print(f"{mode:<9} {success:<7} {ppl_text:<11} {nll_text:<9} {et_text:<11} {ratio_text:<21} {delta_text}")
+        print(f"{name:<22} {success:<7} {ppl_text:<11} {nll_text:<9} {et_text:<7} {ratio_text:<10} {delta_text}")
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Perplexity benchmark with WikiText-2 and decode-path evaluation."
     )
-    parser.add_argument("--mode", choices=["all", "noquant", "kvquant", "asym"], default="all")
+    parser.add_argument("--mode", choices=["all"] + ALL_MODES, default="all")
     parser.add_argument("--model", default=os.path.expanduser("~/huggingface/Qwen3-8B-AWQ/"))
     parser.add_argument("--data-file", default=None)
     parser.add_argument("--prefix-len", type=int, default=256)
@@ -353,7 +380,7 @@ def main():
         os.path.dirname(os.path.abspath(__file__)), "data", "wikitext-2-test.txt"
     )
 
-    if args.mode in {"noquant", "kvquant", "asym"}:
+    if args.mode in ALL_MODES:
         text = load_wikitext(data_file)
         result = run_ppl_mode(
             args.mode, args.model, text,
@@ -363,7 +390,7 @@ def main():
         return
 
     results = {}
-    for mode in ["noquant", "kvquant", "asym"]:
+    for mode in ALL_MODES:
         results[mode] = run_mode_subprocess(
             mode, args.model, data_file,
             args.prefix_len, args.max_eval_tokens, args.chunk_tokens,

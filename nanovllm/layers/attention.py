@@ -141,6 +141,7 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
         self.quantizer = None
         self.k_scales = self.v_scales = None
+        self.k_zeros = None
         self.v_zeros = None
         self.quant_decode_backend = "auto"
         self.decode_k_workspace = None
@@ -158,9 +159,9 @@ class Attention(nn.Module):
         s = algo.s.to(q.device, dtype=qf.dtype)
         return (qf @ pi.t()).contiguous(), (qf @ s.t()).contiguous()
 
-    def _dequantize_k(self, q_tensor: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype, out: torch.Tensor | None = None) -> torch.Tensor:
+    def _dequantize_k(self, q_tensor: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype, out: torch.Tensor | None = None, zeros: torch.Tensor | None = None) -> torch.Tensor:
         if hasattr(self.quantizer, "dequantize_k"):
-            return self.quantizer.dequantize_k(q_tensor, scales, dtype, out=out)
+            return self.quantizer.dequantize_k(q_tensor, scales, dtype, out=out, zeros=zeros)
         return self.quantizer.dequantize(q_tensor, scales, dtype, out=out)
 
     def _dequantize_v(
@@ -204,10 +205,13 @@ class Attention(nn.Module):
 
         k_q, k_s = _gather_quantized_cache(k_cache, k_scales, slot_mapping)
         v_q, v_s = _gather_quantized_cache(v_cache, v_scales, slot_mapping)
+        k_z = None
+        if self.k_zeros is not None:
+            k_z, _ = _gather_quantized_cache(self.k_zeros, self.k_zeros, slot_mapping)
         v_z = None
         if self.v_zeros is not None:
             v_z, _ = _gather_quantized_cache(self.v_zeros, self.v_zeros, slot_mapping)
-        k = self._dequantize_k(k_q, k_s, dtype)
+        k = self._dequantize_k(k_q, k_s, dtype, zeros=k_z)
         v = self._dequantize_v(v_q, v_s, v_z, dtype)
 
         return flash_attn_varlen_func(
@@ -257,13 +261,16 @@ class Attention(nn.Module):
 
         k_q, k_s = _gather_quantized_cache(k_cache, k_scales, slot_mapping)
         v_q, v_s = _gather_quantized_cache(v_cache, v_scales, slot_mapping)
+        k_z = None
+        if self.k_zeros is not None:
+            k_z, _ = _gather_quantized_cache(self.k_zeros, self.k_zeros, slot_mapping)
         v_z = None
         if self.v_zeros is not None:
             v_z, _ = _gather_quantized_cache(self.v_zeros, self.v_zeros, slot_mapping)
 
         k_buf = self.decode_k_workspace[:total_k_tokens]
         v_buf = self.decode_v_workspace[:total_k_tokens]
-        self._dequantize_k(k_q, k_s, dtype, out=k_buf)
+        self._dequantize_k(k_q, k_s, dtype, out=k_buf, zeros=k_z)
         self._dequantize_v(v_q, v_s, v_z, dtype, out=v_buf)
 
         if cu_seqlens_q is None:
@@ -388,15 +395,21 @@ class Attention(nn.Module):
             if self.quantizer:
                 if hasattr(self.quantizer, "quantize_k") and hasattr(self.quantizer, "quantize_v"):
                     if hasattr(self.quantizer, "quantize_kv"):
-                        q_k, scale_k, q_v, scale_v, zero_v = self.quantizer.quantize_kv(k, v)
+                        q_k, scale_k, k_zero, q_v, scale_v, v_zero = self.quantizer.quantize_kv(k, v)
                     else:
-                        q_k, scale_k = self.quantizer.quantize_k(k)
-                        q_v, scale_v, zero_v = self.quantizer.quantize_v(v)
+                        k_result = self.quantizer.quantize_k(k)
+                        q_k, scale_k = k_result[:2]
+                        k_zero = k_result[2] if len(k_result) > 2 else None
+                        v_result = self.quantizer.quantize_v(v)
+                        q_v, scale_v = v_result[:2]
+                        v_zero = v_result[2] if len(v_result) > 2 else None
                     store_kvcache(q_k, q_v, k_cache, v_cache, context.slot_mapping)
                     store_tensor(scale_k, k_scales, context.slot_mapping)
-                    if self.v_zeros is not None:
-                        store_tensor(scale_v, v_scales, context.slot_mapping)
-                        store_tensor(zero_v, self.v_zeros, context.slot_mapping)
+                    if k_zero is not None and self.k_zeros is not None:
+                        store_tensor(k_zero, self.k_zeros, context.slot_mapping)
+                    store_tensor(scale_v, v_scales, context.slot_mapping)
+                    if v_zero is not None and self.v_zeros is not None:
+                        store_tensor(v_zero, self.v_zeros, context.slot_mapping)
                 else:
                     q_k, scale_k = self.quantizer.quantize(k)
                     q_v, scale_v = self.quantizer.quantize(v)
