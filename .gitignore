@@ -196,3 +196,18 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Papers
+*.pdf
+
+# Generated slides
+slides.html
+
+# NCU/nsys profiles
+benchmarks/results/ncu/*.nsys-rep
+benchmarks/results/ncu/*.sqlite
+*.ncu-rep
+*.sqlite
+
+# Claude Code
+.claude/
